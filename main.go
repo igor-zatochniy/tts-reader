@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 func main() {
 	bookPath := flag.String("book", "book.txt", "Path to a UTF-8 text file")
+	savePath := flag.String("save", "book_save.json", "Path to a JSON progress file")
 	chunkSize := flag.Int("chunk", 400, "Maximum runes per TTS request")
 	voice := flag.String("voice", "", "Optional Windows SAPI voice name")
 	timeout := flag.Duration("timeout", 5*time.Minute, "Maximum time for one speech request")
@@ -25,12 +27,47 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	for _, chunk := range splitTextSmart(string(text), *chunkSize) {
+	progress := loadProgress(*savePath)
+	chunks := splitTextSmart(string(text), *chunkSize)
+	for i, chunk := range chunks {
+		if int64(i) < progress.ChunkIndex {
+			continue
+		}
 		if err := speakText(ctx, chunk, *voice, *timeout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		progress.ChunkIndex = int64(i + 1)
+		if err := saveProgress(*savePath, progress); err != nil {
+			fmt.Fprintf(os.Stderr, "save progress: %v\n", err)
+			os.Exit(1)
+		}
 	}
+}
+
+type progressFile struct {
+	ChunkIndex int64 `json:"chunk_index"`
+}
+
+func loadProgress(path string) progressFile {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return progressFile{}
+	}
+
+	var progress progressFile
+	if err := json.Unmarshal(data, &progress); err != nil {
+		return progressFile{}
+	}
+	return progress
+}
+
+func saveProgress(path string, progress progressFile) error {
+	data, err := json.MarshalIndent(progress, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 func splitTextSmart(text string, limit int) []string {
