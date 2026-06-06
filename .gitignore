@@ -9,6 +9,8 @@ audiobook
 # Локальні дані книги та прогресу
 book.txt
 book_save.json
+.*.tmp-*
+
 
 # Файли конфігурації IDE
 .idea/
