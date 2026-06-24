@@ -1,0 +1,359 @@
+openapi: 3.1.0
+info:
+  title: Audiobook TTS Reader Local API
+  version: 1.0.0
+  description: Local loopback API for controlling Windows SAPI audiobook playback.
+servers:
+  - url: http://127.0.0.1:8080
+tags:
+  - name: Voices
+  - name: Books
+  - name: Playback
+  - name: Events
+paths:
+  /api/openapi.yaml:
+    get:
+      tags: [Events]
+      operationId: getOpenAPISpec
+      summary: Get this OpenAPI contract
+      responses:
+        "200":
+          description: OpenAPI YAML document
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /api/v1/voices:
+    get:
+      tags: [Voices]
+      operationId: listVoices
+      summary: List installed Windows SAPI voices
+      responses:
+        "200":
+          description: Installed voices
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoicesResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/books:
+    post:
+      tags: [Books]
+      operationId: addBook
+      summary: Register a local text book
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddBookRequest"
+      responses:
+        "201":
+          description: Registered book
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Book"
+        "400":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Books]
+      operationId: listBooks
+      summary: List registered books for the current process
+      responses:
+        "200":
+          description: Registered books
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BooksResponse"
+
+  /api/v1/playback:
+    post:
+      tags: [Playback]
+      operationId: startPlayback
+      summary: Start audiobook playback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartPlaybackRequest"
+      responses:
+        "202":
+          description: Playback accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybackState"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+    get:
+      tags: [Playback]
+      operationId: getPlaybackState
+      summary: Get current playback state
+      responses:
+        "200":
+          description: Current playback state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybackState"
+
+  /api/v1/playback/pause:
+    post:
+      tags: [Playback]
+      operationId: pausePlayback
+      summary: Pause playback between chunks
+      responses:
+        "200":
+          description: Paused state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybackState"
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/playback/resume:
+    post:
+      tags: [Playback]
+      operationId: resumePlayback
+      summary: Resume paused playback
+      responses:
+        "200":
+          description: Playing state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybackState"
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/playback/stop:
+    post:
+      tags: [Playback]
+      operationId: stopPlayback
+      summary: Stop playback and persist the current byte position
+      responses:
+        "200":
+          description: Stopped state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybackState"
+
+  /api/v1/playback/position:
+    put:
+      tags: [Playback]
+      operationId: setPlaybackPosition
+      summary: Persist a new byte position for a registered book
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetPositionRequest"
+      responses:
+        "200":
+          description: Updated state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybackState"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+
+  /api/v1/events:
+    get:
+      tags: [Events]
+      operationId: streamEvents
+      summary: Stream playback events with Server-Sent Events
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                examples:
+                  - "event: progress.updated\ndata: {\"type\":\"progress.updated\"}\n\n"
+        "500":
+          $ref: "#/components/responses/Error"
+
+components:
+  responses:
+    Error:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    Voice:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          examples: ["Microsoft Irina Desktop"]
+
+    VoicesResponse:
+      type: object
+      additionalProperties: false
+      required: [voices]
+      properties:
+        voices:
+          type: array
+          items:
+            $ref: "#/components/schemas/Voice"
+
+    AddBookRequest:
+      type: object
+      additionalProperties: false
+      required: [path]
+      properties:
+        path:
+          type: string
+          description: Absolute or relative local path to a UTF-8 text file.
+          examples: ["C:\\Books\\novel.txt"]
+        title:
+          type: string
+          examples: ["Novel"]
+        save_file:
+          type: string
+          description: Optional JSON progress file path.
+          examples: ["C:\\Books\\novel.progress.json"]
+
+    Book:
+      type: object
+      additionalProperties: false
+      required: [id, title, path, save_file, size, created_at]
+      properties:
+        id:
+          type: string
+          examples: ["book-1"]
+        title:
+          type: string
+        path:
+          type: string
+        save_file:
+          type: string
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+
+    BooksResponse:
+      type: object
+      additionalProperties: false
+      required: [books]
+      properties:
+        books:
+          type: array
+          items:
+            $ref: "#/components/schemas/Book"
+
+    StartPlaybackRequest:
+      type: object
+      additionalProperties: false
+      required: [book_id]
+      properties:
+        book_id:
+          type: string
+          examples: ["book-1"]
+        voice:
+          type: string
+          examples: ["Microsoft Irina Desktop"]
+        chunk_size:
+          type: integer
+          minimum: 1
+          default: 250
+
+    SetPositionRequest:
+      type: object
+      additionalProperties: false
+      required: [book_id, current_byte]
+      properties:
+        book_id:
+          type: string
+          examples: ["book-1"]
+        current_byte:
+          type: integer
+          format: int64
+          minimum: 0
+
+    PlaybackState:
+      type: object
+      additionalProperties: false
+      required: [state, progress_percent, current_byte]
+      properties:
+        state:
+          type: string
+          enum: [stopped, playing, paused, finished, failed]
+        book_id:
+          type: string
+          examples: ["book-1"]
+        progress_percent:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+        current_byte:
+          type: integer
+          format: int64
+          minimum: 0
+        voice:
+          type: string
+        chunk_size:
+          type: integer
+          minimum: 1
+        error:
+          type: string
+
+    PlaybackEvent:
+      type: object
+      additionalProperties: false
+      required: [type, time, playback]
+      properties:
+        type:
+          type: string
+          enum:
+            - playback.started
+            - chunk.started
+            - progress.updated
+            - playback.paused
+            - playback.resumed
+            - playback.stopped
+            - playback.finished
+            - playback.failed
+            - position.updated
+        time:
+          type: string
+          format: date-time
+        playback:
+          $ref: "#/components/schemas/PlaybackState"
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: string

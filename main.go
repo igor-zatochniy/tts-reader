@@ -9,11 +9,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unicode/utf8"
 )
 
 const (
@@ -25,7 +23,7 @@ const (
 )
 
 type Progress struct {
-	LastPosition int    `json:"last_position"`
+	LastPosition int64  `json:"last_position"`
 	Unit         string `json:"unit"`
 }
 
@@ -58,6 +56,15 @@ func run(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactory) in
 }
 
 func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactory, enableSignals bool) (exitCode int) {
+	if len(args) > 0 {
+		switch args[0] {
+		case "serve":
+			return runServe(args[1:], stdout, stderr, makeSpeaker, listVoices, enableSignals)
+		case "read":
+			args = args[1:]
+		}
+	}
+
 	cfg, err := parseConfig(args, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -78,7 +85,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(stderr, "\n[КРИТИЧНА ПОМИЛКА] Паніка: %v\n", r)
-			if err := app.saveProgress(int(app.pos.Load())); err != nil {
+			if err := app.saveProgress(app.pos.Load()); err != nil {
 				fmt.Fprintf(stderr, "Помилка: не вдалося зберегти прогрес після паніки: %v\n", err)
 			}
 			exitCode = 1
@@ -89,14 +96,18 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 		app.setupGracefulShutdown()
 	}
 
-	content, err := os.ReadFile(cfg.BookFile)
+	info, err := os.Stat(cfg.BookFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося прочитати файл книги %q: %v\n", cfg.BookFile, err)
 		return 1
 	}
+	if info.IsDir() {
+		fmt.Fprintf(stderr, "Помилка: шлях книги %q є директорією\n", cfg.BookFile)
+		return 1
+	}
 
-	fullText := string(content)
-	if len(fullText) == 0 {
+	bookSize := info.Size()
+	if bookSize == 0 {
 		fmt.Fprintln(stdout, "--- ПОРОЖНЯ КНИГА ---")
 		fmt.Fprintf(stdout, "Книга: %s\n", cfg.BookFile)
 		fmt.Fprintf(stdout, "Збереження: %s\n", cfg.SaveFile)
@@ -108,12 +119,18 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 		return 0
 	}
 
-	startPos, err := app.resolveStartPosition(fullText)
+	startPos, err := app.resolveStartPosition(bookSize)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: %v\n", err)
 		return 1
 	}
-	app.pos.Store(int64(startPos))
+	app.pos.Store(startPos)
+
+	preview, err := previewTextFromFile(cfg.BookFile, startPos, previewRuneLimit)
+	if err != nil {
+		fmt.Fprintf(stderr, "Помилка: не вдалося прочитати попередній перегляд книги: %v\n", err)
+		return 1
+	}
 
 	fmt.Fprintf(stdout, "Книга: %s\n", cfg.BookFile)
 	fmt.Fprintf(stdout, "Збереження: %s\n", cfg.SaveFile)
@@ -123,14 +140,46 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 	} else {
 		fmt.Fprintf(stdout, "Голос: %s\n", cfg.Voice)
 	}
-	fmt.Fprintf(stdout, "Прогрес: %.2f%%\n", progressPercent(startPos, len(fullText)))
-	fmt.Fprintf(stdout, "Текст: \"...%s...\"\n", previewText(fullText, startPos, previewRuneLimit))
+	fmt.Fprintf(stdout, "Прогрес: %.2f%%\n", progressPercent(startPos, bookSize))
+	fmt.Fprintf(stdout, "Текст: \"...%s...\"\n", preview)
 	fmt.Fprintln(stdout, "Ctrl+C для виходу.")
 	fmt.Fprintln(stdout, "------------------------------------------------")
 
-	for _, chunk := range splitTextSmart(fullText[startPos:], cfg.ChunkSize) {
-		if err := app.speaker(chunk); err != nil {
-			pos := int(app.pos.Load())
+	book, err := os.Open(cfg.BookFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "Помилка: не вдалося відкрити файл книги %q: %v\n", cfg.BookFile, err)
+		return 1
+	}
+	defer book.Close()
+
+	if _, err := book.Seek(startPos, io.SeekStart); err != nil {
+		fmt.Fprintf(stderr, "Помилка: не вдалося перейти до позиції %d bytes у книзі: %v\n", startPos, err)
+		return 1
+	}
+
+	reader, err := NewStreamingChunkReader(book, startPos, cfg.ChunkSize)
+	if err != nil {
+		fmt.Fprintf(stderr, "Помилка: %v\n", err)
+		return 1
+	}
+
+	for {
+		chunk, err := reader.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			pos := app.pos.Load()
+			fmt.Fprintf(stderr, "\n[ПОМИЛКА ЧИТАННЯ] Не вдалося прочитати фрагмент на позиції %d bytes: %v\n", pos, err)
+			if saveErr := app.saveProgress(pos); saveErr != nil {
+				fmt.Fprintf(stderr, "Помилка: не вдалося зберегти прогрес після збою читання: %v\n", saveErr)
+			}
+			return 1
+		}
+
+		app.pos.Store(chunk.StartByte)
+		if err := app.speaker(chunk.Text); err != nil {
+			pos := app.pos.Load()
 			fmt.Fprintf(stderr, "\n[ПОМИЛКА TTS] PowerShell завершився з помилкою на позиції %d bytes: %v\n", pos, err)
 			if saveErr := app.saveProgress(pos); saveErr != nil {
 				fmt.Fprintf(stderr, "Помилка: не вдалося зберегти прогрес після збою TTS: %v\n", saveErr)
@@ -138,8 +187,8 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 			return 1
 		}
 
-		app.pos.Add(int64(len(chunk)))
-		if err := app.saveProgress(int(app.pos.Load())); err != nil {
+		app.pos.Store(chunk.EndByte)
+		if err := app.saveProgress(app.pos.Load()); err != nil {
 			fmt.Fprintf(stderr, "Помилка: не вдалося записати прогрес: %v\n", err)
 			return 1
 		}
@@ -176,11 +225,14 @@ func parseConfig(args []string, output io.Writer) (Config, error) {
 	return cfg, nil
 }
 
-func (a *App) resolveStartPosition(fullText string) (int, error) {
+func (a *App) resolveStartPosition(bookSize int64) (int64, error) {
 	if a.cfg.StartPhrase != "" {
 		fmt.Fprintf(a.stdout, "--- ПОШУК ФРАЗИ: %q ---\n", a.cfg.StartPhrase)
-		idx := strings.Index(fullText, a.cfg.StartPhrase)
-		if idx == -1 {
+		idx, found, err := findPhraseOffset(a.cfg.BookFile, a.cfg.StartPhrase)
+		if err != nil {
+			return 0, fmt.Errorf("не вдалося знайти стартову фразу: %w", err)
+		}
+		if !found {
 			fmt.Fprintln(a.stdout, "Фразу не знайдено. Старт з початку.")
 			return 0, nil
 		}
@@ -188,7 +240,7 @@ func (a *App) resolveStartPosition(fullText string) (int, error) {
 		return idx, nil
 	}
 
-	savedPos, hasSave, err := a.loadProgress(fullText)
+	savedPos, hasSave, err := a.loadProgress(bookSize)
 	if err != nil {
 		return 0, err
 	}
@@ -201,7 +253,7 @@ func (a *App) resolveStartPosition(fullText string) (int, error) {
 	return 0, nil
 }
 
-func (a *App) loadProgress(fullText string) (int, bool, error) {
+func (a *App) loadProgress(bookSize int64) (int64, bool, error) {
 	file, err := os.ReadFile(a.cfg.SaveFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -217,20 +269,24 @@ func (a *App) loadProgress(fullText string) (int, bool, error) {
 	if p.Unit != PositionUnit {
 		return 0, false, fmt.Errorf("файл прогресу має несумісну одиницю позиції %q", p.Unit)
 	}
-	if p.LastPosition < 0 || p.LastPosition > len(fullText) {
+	if p.LastPosition < 0 || p.LastPosition > bookSize {
 		return 0, false, fmt.Errorf("файл прогресу має позицію поза межами книги: %d", p.LastPosition)
 	}
-	// Файл збереження може бути змінений вручну, тому позицію перевіряємо до зрізання рядка.
-	if !isUTF8Boundary(fullText, p.LastPosition) {
+	// Файл збереження може бути змінений вручну, тому позицію перевіряємо до потокового читання.
+	isBoundary, err := isFileUTF8Boundary(a.cfg.BookFile, p.LastPosition, bookSize)
+	if err != nil {
+		return 0, false, fmt.Errorf("не вдалося перевірити UTF-8 межу прогресу: %w", err)
+	}
+	if !isBoundary {
 		return 0, false, fmt.Errorf("файл прогресу має позицію всередині UTF-8 символу: %d", p.LastPosition)
 	}
-	if p.LastPosition == len(fullText) {
+	if p.LastPosition == bookSize {
 		return 0, false, nil
 	}
 	return p.LastPosition, true, nil
 }
 
-func (a *App) saveProgress(pos int) error {
+func (a *App) saveProgress(pos int64) error {
 	data, err := json.Marshal(Progress{
 		LastPosition: pos,
 		Unit:         PositionUnit,
@@ -294,7 +350,7 @@ func (a *App) setupGracefulShutdown() {
 		// Обробник сигналу читає лише атомарну позицію й завершує процес контрольовано.
 		fmt.Fprintln(a.stdout, "\n--- ЗБЕРЕЖЕННЯ ПЕРЕД ВИХОДОМ... ---")
 
-		pos := int(a.pos.Load())
+		pos := a.pos.Load()
 		if err := a.saveProgress(pos); err != nil {
 			fmt.Fprintf(a.stderr, "Помилка: не вдалося зберегти прогрес перед виходом: %v\n", err)
 			os.Exit(1)
@@ -303,25 +359,7 @@ func (a *App) setupGracefulShutdown() {
 	}()
 }
 
-func isUTF8Boundary(text string, pos int) bool {
-	if pos < 0 || pos > len(text) {
-		return false
-	}
-	return pos == 0 || pos == len(text) || utf8.RuneStart(text[pos])
-}
-
-func previewText(text string, start int, limit int) string {
-	if start >= len(text) || limit <= 0 {
-		return ""
-	}
-	runes := []rune(text[start:])
-	if len(runes) > limit {
-		runes = runes[:limit]
-	}
-	return strings.ReplaceAll(string(runes), "\n", " ")
-}
-
-func progressPercent(pos int, total int) float64 {
+func progressPercent(pos int64, total int64) float64 {
 	if total == 0 {
 		return 100
 	}

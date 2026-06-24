@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,6 +128,21 @@ func TestRunUsesStartPhraseAndResetsProgressAfterSuccess(t *testing.T) {
 	assertSavedPosition(t, save, 0)
 }
 
+func TestRunReadSubcommandUsesCLIReader(t *testing.T) {
+	dir := t.TempDir()
+	book := filepath.Join(dir, "book.txt")
+	save := filepath.Join(dir, "save.json")
+	mustWriteFile(t, book, "Текст.")
+
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"read", "-book", book, "-save", save}, &stdout, &stderr, testSpeaker(nil), false)
+
+	if code != 0 {
+		t.Fatalf("очікував успішний запуск, отримав %d, stderr=%q", code, stderr.String())
+	}
+	assertSavedPosition(t, save, 0)
+}
+
 func TestRunPersistsPositionOnSpeakerFailure(t *testing.T) {
 	dir := t.TempDir()
 	book := filepath.Join(dir, "book.txt")
@@ -148,6 +164,48 @@ func TestRunPersistsPositionOnSpeakerFailure(t *testing.T) {
 	assertSavedPosition(t, save, 0)
 }
 
+func TestRunPersistsCompletedStreamingPositionOnSecondChunkFailure(t *testing.T) {
+	dir := t.TempDir()
+	book := filepath.Join(dir, "book.txt")
+	save := filepath.Join(dir, "save.json")
+	mustWriteFile(t, book, "Перший. Другий.")
+
+	speakerErr := errors.New("tts failed")
+	call := 0
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", book, "-save", save, "-chunk", "8"}, &stdout, &stderr, testSpeaker(func(text string) error {
+		call++
+		if call == 2 {
+			return speakerErr
+		}
+		return nil
+	}), false)
+
+	if code != 1 {
+		t.Fatalf("очікував exit code 1, отримав %d", code)
+	}
+	assertSavedPosition(t, save, int64(len("Перший.")))
+}
+
+func TestRunRejectsInvalidUTF8Book(t *testing.T) {
+	dir := t.TempDir()
+	book := filepath.Join(dir, "book.txt")
+	save := filepath.Join(dir, "save.json")
+	if err := os.WriteFile(book, []byte{0xff}, 0644); err != nil {
+		t.Fatalf("не вдалося записати тестовий файл: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", book, "-save", save}, &stdout, &stderr, testSpeaker(nil), false)
+
+	if code != 1 {
+		t.Fatalf("очікував exit code 1, отримав %d", code)
+	}
+	if !strings.Contains(stderr.String(), "UTF-8") {
+		t.Fatalf("очікував помилку UTF-8, stderr=%q", stderr.String())
+	}
+}
+
 func TestSplitTextSmartKeepsUnicodeText(t *testing.T) {
 	chunks := splitTextSmart("Привіт, світе! Наступне речення.", 16)
 
@@ -156,6 +214,41 @@ func TestSplitTextSmartKeepsUnicodeText(t *testing.T) {
 	}
 	if strings.Join(chunks, "") != "Привіт, світе! Наступне речення." {
 		t.Fatalf("фрагменти не відновлюють початковий текст: %#v", chunks)
+	}
+}
+
+func TestStreamingChunkReaderKeepsUnicodeTextAndByteOffsets(t *testing.T) {
+	text := "Привіт, світе! Наступне речення."
+	reader, err := NewStreamingChunkReader(strings.NewReader(text), 0, 16)
+	if err != nil {
+		t.Fatalf("не вдалося створити streaming reader: %v", err)
+	}
+
+	var joined strings.Builder
+	wantStart := int64(0)
+	for {
+		chunk, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("неочікувана помилка reader.Next: %v", err)
+		}
+		if chunk.StartByte != wantStart {
+			t.Fatalf("очікував start byte %d, отримав %d", wantStart, chunk.StartByte)
+		}
+		if chunk.EndByte <= chunk.StartByte {
+			t.Fatalf("некоректні межі фрагмента: %#v", chunk)
+		}
+		joined.WriteString(chunk.Text)
+		wantStart = chunk.EndByte
+	}
+
+	if joined.String() != text {
+		t.Fatalf("фрагменти не відновлюють початковий текст: %q", joined.String())
+	}
+	if wantStart != int64(len(text)) {
+		t.Fatalf("очікував фінальний byte offset %d, отримав %d", len(text), wantStart)
 	}
 }
 
@@ -188,7 +281,7 @@ func mustWriteProgress(t *testing.T, path string, progress Progress) {
 	}
 }
 
-func assertSavedPosition(t *testing.T, path string, want int) {
+func assertSavedPosition(t *testing.T, path string, want int64) {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {

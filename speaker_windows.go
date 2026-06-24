@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -52,4 +53,34 @@ func speakWindows(text string, voice string, timeout time.Duration) error {
 		return err
 	}
 	return nil
+}
+
+func listVoices() ([]string, error) {
+	psScript := "$ErrorActionPreference = 'Stop'; " +
+		"Add-Type -AssemblyName System.Speech; " +
+		"$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; " +
+		"$speak.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+
+	output, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("voice discovery timed out")
+		}
+		return nil, err
+	}
+
+	var voices []string
+	for _, line := range strings.Split(string(output), "\n") {
+		voice := strings.TrimSpace(line)
+		if voice != "" {
+			voices = append(voices, voice)
+		}
+	}
+	return voices, nil
 }
