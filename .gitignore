@@ -11,6 +11,12 @@ book.txt
 book_save.json
 .*.tmp-*
 
+# Профілі та benchmark-артефакти
+cpu.out
+mem.out
+*.prof
+*.test
+*.test.exe
 
 # Файли конфігурації IDE
 .idea/
