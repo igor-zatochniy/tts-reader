@@ -14,12 +14,12 @@ import (
 )
 
 func newSpeaker(cfg Config) speakFunc {
-	return func(text string) error {
-		return speakWindows(text, cfg.Voice, cfg.TTSTimeout)
+	return func(ctx context.Context, text string) error {
+		return speakWindows(ctx, text, cfg.Voice, cfg.TTSTimeout)
 	}
 }
 
-func speakWindows(text string, voice string, timeout time.Duration) error {
+func speakWindows(parent context.Context, text string, voice string, timeout time.Duration) error {
 	// Текст і назву голосу передаємо через base64 env vars, щоб не інтерполювати ввід у PowerShell script.
 	psScript := "$ErrorActionPreference = 'Stop'; " +
 		"Add-Type -AssemblyName System.Speech; " +
@@ -34,7 +34,7 @@ func speakWindows(text string, voice string, timeout time.Duration) error {
 		"if ([string]::IsNullOrEmpty($rawText)) { exit 0 }; " +
 		"$speak.Speak($rawText)"
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	// Таймаут захищає CLI від зависання Windows SAPI або аудіостека.
@@ -49,6 +49,9 @@ func speakWindows(text string, voice string, timeout time.Duration) error {
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("TTS command timed out after %s", timeout)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		return err
 	}

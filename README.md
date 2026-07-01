@@ -59,10 +59,10 @@ go run . -book book.txt -save book_save.json
 go run . serve
 ```
 
-За замовчуванням API слухає тільки loopback-адресу:
+За замовчуванням API слухає тільки loopback-адресу і друкує одноразовий token для керування:
 
 ```text
-http://127.0.0.1:8080
+Local TTS API listening on http://127.0.0.1:8080/?token=<token>
 ```
 
 ## Приклади
@@ -99,10 +99,10 @@ Windows SAPI
 Windows Audio
 ```
 
-Вбудована browser-панель доступна на:
+Вбудована browser-панель доступна за URL, який друкує `serve`:
 
 ```text
-http://127.0.0.1:8080/
+http://127.0.0.1:8080/?token=<token>
 ```
 
 OpenAPI contract:
@@ -112,7 +112,17 @@ api/openapi.yaml
 http://127.0.0.1:8080/api/openapi.yaml
 ```
 
-API DTO у Go-коді відповідають схемам OpenAPI (`AddBookRequest`, `StartPlaybackRequest`, `SetPositionRequest`, `Book`, `Voice`, `PlaybackState`). TTS backend ізольований через `TTSEngine`, тому HTTP handlers і тести не залежать від реального Windows audio.
+API DTO у Go-коді відповідають схемам OpenAPI (`AddBookRequest`, `StartPlaybackRequest`, `SetPositionRequest`, `PublicBook`, `Voice`, `PlaybackState`). TTS backend ізольований через `TTSEngine`, тому HTTP handlers і тести не залежать від реального Windows audio.
+
+Security model:
+
+- HTTP server приймає тільки loopback bind, наприклад `127.0.0.1:8080` або `localhost:8080`.
+- Middleware перевіряє `Host` і `Origin`, щоб стороння browser-сторінка не могла керувати локальним TTS service.
+- `POST`, `PUT`, `PATCH`, `DELETE` і `GET /api/v1/events` потребують token через `X-TTS-Token` або `?token=`.
+- HTTP API не приймає `save_file` і не повертає абсолютні filesystem paths; progress-файл є внутрішньою деталлю застосунку.
+- Книга стартує тільки якщо файл не змінився після реєстрації: перевіряються size, modification time і sampled SHA-256 fingerprint.
+- Помилки API повертаються у структурованому форматі `{ "code": "...", "error": "..." }`; `Stop` повертає playback snapshot навіть якщо progress не вдалося зберегти.
+- JSON endpoints перевіряють `Content-Type: application/json`, unknown fields, required fields, UTF-8 byte positions і межі `chunk_size`.
 
 Endpoints:
 
@@ -133,7 +143,9 @@ Endpoints:
 Приклад додавання книги:
 
 ```powershell
+$token = "<token from serve output>"
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/api/v1/books `
+  -Headers @{ "X-TTS-Token" = $token } `
   -ContentType 'application/json' `
   -Body '{"path":"C:\\Books\\novel.txt","title":"Novel"}'
 ```
@@ -200,6 +212,7 @@ position.updated
 
 ```powershell
 go mod verify
+npx --yes @redocly/cli@2.38.0 lint api/openapi.yaml
 go test ./...
 go test -race ./...
 go vet ./...
@@ -277,7 +290,7 @@ Benchmark matrix містить ASCII і UTF-8 книги розміром 1 MB,
 
 ## CI
 
-GitHub Actions workflow у `.github/workflows/ci.yml` запускається на `windows-latest` і перевіряє форматування, модулі, тести, race detector, `go vet`, `staticcheck`, `govulncheck` та збірку.
+GitHub Actions workflow у `.github/workflows/ci.yml` запускається на `windows-latest` і перевіряє форматування, OpenAPI contract, модулі, тести, race detector, `go vet`, `staticcheck`, `govulncheck` та збірку.
 
 ## Файли користувача
 

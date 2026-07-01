@@ -2,10 +2,13 @@
 
 package main
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 func newSpeaker(cfg Config) speakFunc {
-	return func(text string) error {
+	return func(ctx context.Context, text string) error {
 		return fmt.Errorf("Windows SAPI TTS is supported only on Windows Desktop")
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -255,9 +256,11 @@ func TestStreamingChunkReaderKeepsUnicodeTextAndByteOffsets(t *testing.T) {
 func testSpeaker(fn func(text string) error) speakerFactory {
 	return func(cfg Config) speakFunc {
 		if fn != nil {
-			return fn
+			return func(ctx context.Context, text string) error {
+				return fn(text)
+			}
 		}
-		return func(text string) error {
+		return func(ctx context.Context, text string) error {
 			return nil
 		}
 	}

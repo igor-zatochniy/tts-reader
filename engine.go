@@ -31,17 +31,7 @@ func newFunctionEngineFactory(makeSpeaker speakerFactory, voices voiceProvider) 
 }
 
 func (e *functionEngine) Speak(ctx context.Context, text string) error {
-	done := make(chan error, 1)
-	go func() {
-		done <- e.speaker(text)
-	}()
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return e.speaker(ctx, text)
 }
 
 func (e *functionEngine) Voices(ctx context.Context) ([]Voice, error) {
@@ -63,5 +53,5 @@ func (e *functionEngine) Voices(ctx context.Context) ([]Voice, error) {
 }
 
 func (e *functionEngine) Stop(ctx context.Context) error {
-	return ctx.Err()
+	return nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -36,7 +37,7 @@ type Config struct {
 	TTSTimeout  time.Duration
 }
 
-type speakFunc func(text string) error
+type speakFunc func(ctx context.Context, text string) error
 type speakerFactory func(cfg Config) speakFunc
 
 type App struct {
@@ -44,6 +45,7 @@ type App struct {
 	speaker speakFunc
 	stdout  io.Writer
 	stderr  io.Writer
+	ctx     context.Context
 	pos     atomic.Int64
 }
 
@@ -74,11 +76,19 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 		return 2
 	}
 
+	ctx := context.Background()
+	cleanupSignals := func() {}
+	if enableSignals {
+		ctx, cleanupSignals = interruptContext()
+	}
+	defer cleanupSignals()
+
 	app := &App{
 		cfg:     cfg,
 		speaker: makeSpeaker(cfg),
 		stdout:  stdout,
 		stderr:  stderr,
+		ctx:     ctx,
 	}
 
 	// Останній запобіжник для CLI: зберігаємо прогрес навіть після неочікуваної panic.
@@ -91,10 +101,6 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 			exitCode = 1
 		}
 	}()
-
-	if enableSignals {
-		app.setupGracefulShutdown()
-	}
 
 	info, err := os.Stat(cfg.BookFile)
 	if err != nil {
@@ -164,6 +170,10 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 	}
 
 	for {
+		if app.ctx.Err() != nil {
+			return app.persistInterruptedProgress()
+		}
+
 		chunk, err := reader.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -178,7 +188,10 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 		}
 
 		app.pos.Store(chunk.StartByte)
-		if err := app.speaker(chunk.Text); err != nil {
+		if err := app.speaker(app.ctx, chunk.Text); err != nil {
+			if app.ctx.Err() != nil {
+				return app.persistInterruptedProgress()
+			}
 			pos := app.pos.Load()
 			fmt.Fprintf(stderr, "\n[ПОМИЛКА TTS] PowerShell завершився з помилкою на позиції %d bytes: %v\n", pos, err)
 			if saveErr := app.saveProgress(pos); saveErr != nil {
@@ -342,21 +355,40 @@ func writeFileReplace(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-func (a *App) setupGracefulShutdown() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		// Обробник сигналу читає лише атомарну позицію й завершує процес контрольовано.
-		fmt.Fprintln(a.stdout, "\n--- ЗБЕРЕЖЕННЯ ПЕРЕД ВИХОДОМ... ---")
+func interruptContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 
-		pos := a.pos.Load()
-		if err := a.saveProgress(pos); err != nil {
-			fmt.Fprintf(a.stderr, "Помилка: не вдалося зберегти прогрес перед виходом: %v\n", err)
-			os.Exit(1)
+	go func() {
+		select {
+		case <-signals:
+			cancel()
+		case <-ctx.Done():
+			return
 		}
-		os.Exit(0)
+
+		select {
+		case <-signals:
+			os.Exit(130)
+		case <-ctx.Done():
+			return
+		}
 	}()
+
+	return ctx, func() {
+		signal.Stop(signals)
+		cancel()
+	}
+}
+
+func (a *App) persistInterruptedProgress() int {
+	fmt.Fprintln(a.stdout, "\n--- ЗБЕРЕЖЕННЯ ПЕРЕД ВИХОДОМ... ---")
+	if err := a.saveProgress(a.pos.Load()); err != nil {
+		fmt.Fprintf(a.stderr, "Помилка: не вдалося зберегти прогрес: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func progressPercent(pos int64, total int64) float64 {

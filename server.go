@@ -2,13 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	_ "embed"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -30,6 +38,26 @@ const (
 	playbackPaused   = "paused"
 	playbackFinished = "finished"
 	playbackFailed   = "failed"
+
+	maxChunkSize = 10000
+)
+
+var (
+	ErrPlaybackActive      = errors.New("playback active")
+	ErrPlaybackNotPlaying  = errors.New("playback not playing")
+	ErrPlaybackNotPaused   = errors.New("playback not paused")
+	ErrBookModified        = errors.New("book modified")
+	ErrBookNotFound        = errors.New("book not found")
+	ErrBookNotReadable     = errors.New("book not readable")
+	ErrBookNotRegular      = errors.New("book must be a regular file")
+	ErrPathRequired        = errors.New("path required")
+	ErrBookIDRequired      = errors.New("book_id required")
+	ErrCurrentByteRequired = errors.New("current_byte required")
+	ErrPositionOutsideBook = errors.New("position outside book")
+	ErrPositionInsideRune  = errors.New("position inside UTF-8 rune")
+	ErrInvalidChunkSize    = errors.New("invalid chunk_size")
+	ErrUnsupportedMedia    = errors.New("unsupported media type")
+	ErrInvalidJSON         = errors.New("invalid JSON request")
 )
 
 type voiceProvider func() ([]string, error)
@@ -40,12 +68,25 @@ type ServeConfig struct {
 }
 
 type Book struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Path      string    `json:"path"`
-	SaveFile  string    `json:"save_file"`
-	Size      int64     `json:"size"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        string           `json:"-"`
+	Title     string           `json:"-"`
+	Path      string           `json:"-"`
+	SaveFile  string           `json:"-"`
+	Size      int64            `json:"-"`
+	File      BookFileIdentity `json:"-"`
+	CreatedAt time.Time        `json:"-"`
+}
+
+type BookFileIdentity struct {
+	Size        int64
+	ModifiedAt  time.Time
+	Fingerprint string
+}
+
+type PublicBook struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Size  int64  `json:"size"`
 }
 
 type BookStore struct {
@@ -75,12 +116,22 @@ type EventBroker struct {
 	clients map[chan PlaybackEvent]struct{}
 }
 
+type playbackSession struct {
+	id     uint64
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+	engine TTSEngine
+}
+
 type PlaybackManager struct {
+	controlMu  sync.Mutex
 	mu         sync.Mutex
 	cond       *sync.Cond
 	engines    engineFactory
 	ttsTimeout time.Duration
 	events     *EventBroker
+	progress   ProgressStore
 
 	state       string
 	book        Book
@@ -88,31 +139,46 @@ type PlaybackManager struct {
 	voice       string
 	chunkSize   int
 	errMessage  string
-	cancel      context.CancelFunc
+	nextID      uint64
+	active      *playbackSession
 }
 
 type LocalAPI struct {
 	store    *BookStore
 	playback *PlaybackManager
 	engines  engineFactory
+	token    string
 }
 
 type AddBookRequest struct {
-	Path     string `json:"path"`
-	Title    string `json:"title"`
-	SaveFile string `json:"save_file"`
+	Path  string `json:"path"`
+	Title string `json:"title"`
 }
 
 type StartPlaybackRequest struct {
 	BookID    string `json:"book_id"`
-	Voice     string `json:"voice"`
-	ChunkSize int    `json:"chunk_size"`
+	Voice     string `json:"voice,omitempty"`
+	ChunkSize *int   `json:"chunk_size,omitempty"`
 }
 
 type SetPositionRequest struct {
 	BookID      string `json:"book_id"`
-	CurrentByte int64  `json:"current_byte"`
+	CurrentByte *int64 `json:"current_byte"`
 }
+
+type ErrorResponse struct {
+	Code     string            `json:"code"`
+	Error    string            `json:"error"`
+	Playback *PlaybackSnapshot `json:"playback,omitempty"`
+}
+
+type ProgressStore interface {
+	Load(book Book, currentSize int64) (int64, error)
+	Save(book Book, position int64) error
+	Reset(book Book) error
+}
+
+type JSONProgressStore struct{}
 
 func parseServeConfig(args []string, output io.Writer) (ServeConfig, error) {
 	fs := flag.NewFlagSet("audiobook serve", flag.ContinueOnError)
@@ -127,6 +193,9 @@ func parseServeConfig(args []string, output io.Writer) (ServeConfig, error) {
 	}
 	if cfg.Addr == "" {
 		return ServeConfig{}, fmt.Errorf("значення -addr не може бути порожнім")
+	}
+	if !isLoopbackHost(cfg.Addr) {
+		return ServeConfig{}, fmt.Errorf("значення -addr має бути loopback адресою, наприклад %s", defaultServeAddr)
 	}
 	if cfg.TTSTimeout <= 0 {
 		return ServeConfig{}, fmt.Errorf("значення -tts-timeout має бути більшим за 0")
@@ -146,7 +215,12 @@ func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactor
 
 	events := NewEventBroker()
 	engines := newFunctionEngineFactory(makeSpeaker, voices)
-	api := NewLocalAPI(NewBookStore(), NewPlaybackManager(engines, cfg.TTSTimeout, events), engines)
+	token, err := generateAPIToken()
+	if err != nil {
+		fmt.Fprintf(stderr, "Помилка: не вдалося створити API token: %v\n", err)
+		return 1
+	}
+	api := NewLocalAPI(NewBookStore(), NewPlaybackManager(engines, cfg.TTSTimeout, events), engines, token)
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           api.Routes(),
@@ -159,7 +233,7 @@ func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactor
 		errCh <- server.ListenAndServe()
 	}()
 
-	fmt.Fprintf(stdout, "Local TTS API listening on http://%s\n", cfg.Addr)
+	fmt.Fprintf(stdout, "Local TTS API listening on http://%s/?token=%s\n", cfg.Addr, token)
 	if !enableSignals {
 		return waitHTTPServer(stderr, errCh)
 	}
@@ -169,9 +243,9 @@ func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactor
 
 	select {
 	case <-ctx.Done():
-		api.playback.Stop()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		_, _ = api.playback.Stop(shutdownCtx)
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			fmt.Fprintf(stderr, "Помилка: не вдалося коректно зупинити HTTP API: %v\n", err)
 			return 1
@@ -195,35 +269,80 @@ func waitHTTPServer(stderr io.Writer, errCh <-chan error) int {
 	return 1
 }
 
+func generateAPIToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+func isLoopbackHost(hostport string) bool {
+	host := hostport
+	if parsedHost, _, err := net.SplitHostPort(hostport); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isAllowedOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host) && isLoopbackHost(parsed.Host)
+}
+
+func (api *LocalAPI) requiresToken(r *http.Request) bool {
+	if api.token == "" {
+		return false
+	}
+	if r.URL.Path == "/api/v1/events" {
+		return true
+	}
+	return r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete
+}
+
+func (api *LocalAPI) authorized(r *http.Request) bool {
+	if api.token == "" {
+		return true
+	}
+	token := r.Header.Get("X-TTS-Token")
+	if token == "" {
+		token = r.URL.Query().Get("token")
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(api.token)) == 1
+}
+
 func NewBookStore() *BookStore {
 	return &BookStore{books: make(map[string]Book)}
 }
 
 func (s *BookStore) Add(req AddBookRequest) (Book, error) {
 	if strings.TrimSpace(req.Path) == "" {
-		return Book{}, fmt.Errorf("path is required")
+		return Book{}, ErrPathRequired
 	}
 
 	absPath, err := filepath.Abs(req.Path)
 	if err != nil {
-		return Book{}, fmt.Errorf("invalid book path: %w", err)
+		return Book{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
 	}
-	info, err := os.Stat(absPath)
+	identity, err := inspectBookFile(absPath)
 	if err != nil {
-		return Book{}, fmt.Errorf("book is not readable: %w", err)
-	}
-	if info.IsDir() {
-		return Book{}, fmt.Errorf("book path must point to a file")
-	}
-
-	saveFile := strings.TrimSpace(req.SaveFile)
-	if saveFile == "" {
-		saveFile = defaultProgressPath(absPath)
-	} else {
-		saveFile, err = filepath.Abs(saveFile)
-		if err != nil {
-			return Book{}, fmt.Errorf("invalid save_file path: %w", err)
-		}
+		return Book{}, err
 	}
 
 	title := strings.TrimSpace(req.Title)
@@ -238,8 +357,9 @@ func (s *BookStore) Add(req AddBookRequest) (Book, error) {
 		ID:        fmt.Sprintf("book-%d", s.next),
 		Title:     title,
 		Path:      absPath,
-		SaveFile:  saveFile,
-		Size:      info.Size(),
+		SaveFile:  defaultProgressPath(absPath),
+		Size:      identity.Size,
+		File:      identity,
 		CreatedAt: time.Now().UTC(),
 	}
 	s.books[book.ID] = book
@@ -264,12 +384,113 @@ func (s *BookStore) Get(id string) (Book, bool) {
 	return book, ok
 }
 
+func publicBook(book Book) PublicBook {
+	return PublicBook{ID: book.ID, Title: book.Title, Size: book.Size}
+}
+
+func publicBooks(books []Book) []PublicBook {
+	result := make([]PublicBook, 0, len(books))
+	for _, book := range books {
+		result = append(result, publicBook(book))
+	}
+	return result
+}
+
 func defaultProgressPath(bookPath string) string {
 	ext := filepath.Ext(bookPath)
 	if ext == "" {
 		return bookPath + ".progress.json"
 	}
 	return strings.TrimSuffix(bookPath, ext) + ".progress.json"
+}
+
+func inspectBookFile(path string) (BookFileIdentity, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+	}
+	if !info.Mode().IsRegular() {
+		return BookFileIdentity{}, ErrBookNotRegular
+	}
+
+	hash := sha256.New()
+	fmt.Fprintf(hash, "size:%d\n", info.Size())
+
+	const sampleSize int64 = 64 << 10
+	headSize := minInt64(info.Size(), sampleSize)
+	if headSize > 0 {
+		if _, err := io.CopyN(hash, file, headSize); err != nil {
+			return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+		}
+	}
+	if info.Size() > sampleSize {
+		if _, err := file.Seek(info.Size()-sampleSize, io.SeekStart); err != nil {
+			return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+		}
+		if _, err := io.CopyN(hash, file, sampleSize); err != nil {
+			return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+		}
+	}
+
+	return BookFileIdentity{
+		Size:        info.Size(),
+		ModifiedAt:  info.ModTime().UTC(),
+		Fingerprint: hex.EncodeToString(hash.Sum(nil)),
+	}, nil
+}
+
+func sameBookFile(registered BookFileIdentity, current BookFileIdentity) bool {
+	return registered.Size == current.Size &&
+		registered.ModifiedAt.Equal(current.ModifiedAt) &&
+		registered.Fingerprint == current.Fingerprint
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func validateStartPlaybackRequest(req StartPlaybackRequest) (int, error) {
+	if strings.TrimSpace(req.BookID) == "" {
+		return 0, ErrBookIDRequired
+	}
+	if req.ChunkSize == nil {
+		return defaultChunkSize, nil
+	}
+	if *req.ChunkSize < 1 || *req.ChunkSize > maxChunkSize {
+		return 0, fmt.Errorf("%w: chunk_size must be between 1 and %d", ErrInvalidChunkSize, maxChunkSize)
+	}
+	return *req.ChunkSize, nil
+}
+
+func validateSetPositionRequest(req SetPositionRequest) (int64, error) {
+	if strings.TrimSpace(req.BookID) == "" {
+		return 0, ErrBookIDRequired
+	}
+	if req.CurrentByte == nil {
+		return 0, ErrCurrentByteRequired
+	}
+	if *req.CurrentByte < 0 {
+		return 0, ErrPositionOutsideBook
+	}
+	return *req.CurrentByte, nil
+}
+
+func requireJSONContentType(r *http.Request) error {
+	contentType := r.Header.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || mediaType != "application/json" {
+		return ErrUnsupportedMedia
+	}
+	return nil
 }
 
 func NewEventBroker() *EventBroker {
@@ -302,10 +523,18 @@ func (b *EventBroker) Publish(event PlaybackEvent) {
 }
 
 func NewPlaybackManager(engines engineFactory, ttsTimeout time.Duration, events *EventBroker) *PlaybackManager {
+	return NewPlaybackManagerWithProgress(engines, ttsTimeout, events, JSONProgressStore{})
+}
+
+func NewPlaybackManagerWithProgress(engines engineFactory, ttsTimeout time.Duration, events *EventBroker, progress ProgressStore) *PlaybackManager {
+	if progress == nil {
+		progress = JSONProgressStore{}
+	}
 	m := &PlaybackManager{
 		engines:    engines,
 		ttsTimeout: ttsTimeout,
 		events:     events,
+		progress:   progress,
 		state:      playbackStopped,
 		chunkSize:  defaultChunkSize,
 	}
@@ -314,25 +543,51 @@ func NewPlaybackManager(engines engineFactory, ttsTimeout time.Duration, events 
 }
 
 func (m *PlaybackManager) Start(book Book, req StartPlaybackRequest) (PlaybackSnapshot, error) {
-	chunkSize := req.ChunkSize
-	if chunkSize == 0 {
-		chunkSize = defaultChunkSize
-	}
-	if chunkSize < 0 {
-		return PlaybackSnapshot{}, fmt.Errorf("chunk_size must be greater than 0")
+	m.controlMu.Lock()
+	defer m.controlMu.Unlock()
+
+	chunkSize, err := validateStartPlaybackRequest(req)
+	if err != nil {
+		return PlaybackSnapshot{}, err
 	}
 
-	startPos, err := loadBookProgress(book)
+	currentFile, err := inspectBookFile(book.Path)
+	if err != nil {
+		return PlaybackSnapshot{}, fmt.Errorf("inspect current book file: %w", err)
+	}
+	if !sameBookFile(book.File, currentFile) {
+		return PlaybackSnapshot{}, fmt.Errorf("%w: book file changed after registration", ErrBookModified)
+	}
+	book.Size = currentFile.Size
+	book.File = currentFile
+
+	startPos, err := m.progress.Load(book, currentFile.Size)
 	if err != nil {
 		return PlaybackSnapshot{}, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	engine := m.engines(Config{
+		BookFile:   book.Path,
+		SaveFile:   book.SaveFile,
+		Voice:      req.Voice,
+		ChunkSize:  chunkSize,
+		TTSTimeout: m.ttsTimeout,
+	})
+
 	m.mu.Lock()
-	if m.state == playbackPlaying || m.state == playbackPaused {
+	if m.active != nil || m.state == playbackPlaying || m.state == playbackPaused {
 		m.mu.Unlock()
 		cancel()
-		return PlaybackSnapshot{}, fmt.Errorf("playback is already active")
+		return PlaybackSnapshot{}, ErrPlaybackActive
+	}
+	m.nextID++
+	session := &playbackSession{
+		id:     m.nextID,
+		ctx:    ctx,
+		cancel: cancel,
+		done:   make(chan struct{}),
+		engine: engine,
 	}
 	m.state = playbackPlaying
 	m.book = book
@@ -340,21 +595,24 @@ func (m *PlaybackManager) Start(book Book, req StartPlaybackRequest) (PlaybackSn
 	m.voice = req.Voice
 	m.chunkSize = chunkSize
 	m.errMessage = ""
-	m.cancel = cancel
+	m.active = session
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
 
 	m.publish("playback.started", snapshot)
-	go m.play(ctx, book, startPos, req.Voice, chunkSize)
+	go m.play(session, book, startPos, chunkSize)
 	return snapshot, nil
 }
 
 func (m *PlaybackManager) Pause() (PlaybackSnapshot, error) {
+	m.controlMu.Lock()
+	defer m.controlMu.Unlock()
+
 	m.mu.Lock()
 	if m.state != playbackPlaying {
 		snapshot := m.snapshotLocked()
 		m.mu.Unlock()
-		return snapshot, fmt.Errorf("playback is not playing")
+		return snapshot, ErrPlaybackNotPlaying
 	}
 	m.state = playbackPaused
 	snapshot := m.snapshotLocked()
@@ -365,11 +623,14 @@ func (m *PlaybackManager) Pause() (PlaybackSnapshot, error) {
 }
 
 func (m *PlaybackManager) Resume() (PlaybackSnapshot, error) {
+	m.controlMu.Lock()
+	defer m.controlMu.Unlock()
+
 	m.mu.Lock()
 	if m.state != playbackPaused {
 		snapshot := m.snapshotLocked()
 		m.mu.Unlock()
-		return snapshot, fmt.Errorf("playback is not paused")
+		return snapshot, ErrPlaybackNotPaused
 	}
 	m.state = playbackPlaying
 	m.cond.Broadcast()
@@ -380,54 +641,84 @@ func (m *PlaybackManager) Resume() (PlaybackSnapshot, error) {
 	return snapshot, nil
 }
 
-func (m *PlaybackManager) Stop() PlaybackSnapshot {
+func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
+	m.controlMu.Lock()
+	defer m.controlMu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var session *playbackSession
 	var book Book
 	var pos int64
-	var shouldSave bool
 
 	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
+	session = m.active
 	if m.book.ID != "" {
 		book = m.book
 		pos = m.currentByte
-		shouldSave = true
 	}
 	m.state = playbackStopped
 	m.errMessage = ""
 	m.cond.Broadcast()
+	m.mu.Unlock()
+
+	var stopErr error
+	if session != nil {
+		session.cancel()
+		stopErr = errors.Join(stopErr, session.engine.Stop(ctx))
+		select {
+		case <-session.done:
+		case <-ctx.Done():
+			stopErr = errors.Join(stopErr, ctx.Err())
+		}
+	}
+	if book.ID != "" {
+		stopErr = errors.Join(stopErr, m.progress.Save(book, pos))
+	}
+
+	m.mu.Lock()
+	if m.active == session {
+		m.active = nil
+	}
+	m.state = playbackStopped
+	if stopErr != nil {
+		m.errMessage = stopErr.Error()
+	} else {
+		m.errMessage = ""
+	}
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
 
-	if shouldSave {
-		_ = saveBookProgress(book, pos)
-	}
 	m.publish("playback.stopped", snapshot)
-	return snapshot
+	return snapshot, stopErr
 }
 
 func (m *PlaybackManager) SetPosition(book Book, pos int64) (PlaybackSnapshot, error) {
+	m.controlMu.Lock()
+	defer m.controlMu.Unlock()
+
 	m.mu.Lock()
-	if m.state == playbackPlaying || m.state == playbackPaused {
+	if m.active != nil || m.state == playbackPlaying || m.state == playbackPaused {
+		snapshot := m.snapshotLocked()
 		m.mu.Unlock()
-		return PlaybackSnapshot{}, fmt.Errorf("cannot change position while playback is active")
+		return snapshot, ErrPlaybackActive
 	}
 	m.mu.Unlock()
 
 	if pos < 0 || pos > book.Size {
-		return PlaybackSnapshot{}, fmt.Errorf("position is outside the book")
+		return PlaybackSnapshot{}, ErrPositionOutsideBook
 	}
 	ok, err := isFileUTF8Boundary(book.Path, pos, book.Size)
 	if err != nil {
-		return PlaybackSnapshot{}, err
+		return PlaybackSnapshot{}, fmt.Errorf("check UTF-8 boundary: %w", err)
 	}
 	if !ok {
-		return PlaybackSnapshot{}, fmt.Errorf("position is inside a UTF-8 character")
+		return PlaybackSnapshot{}, ErrPositionInsideRune
 	}
-	if err := saveBookProgress(book, pos); err != nil {
-		return PlaybackSnapshot{}, err
+	if err := m.progress.Save(book, pos); err != nil {
+		return PlaybackSnapshot{}, fmt.Errorf("save position: %w", err)
 	}
 
 	m.mu.Lock()
@@ -448,71 +739,68 @@ func (m *PlaybackManager) Snapshot() PlaybackSnapshot {
 	return m.snapshotLocked()
 }
 
-func (m *PlaybackManager) play(ctx context.Context, book Book, startPos int64, voice string, chunkSize int) {
+func (m *PlaybackManager) play(session *playbackSession, book Book, startPos int64, chunkSize int) {
+	defer close(session.done)
+
 	file, err := os.Open(book.Path)
 	if err != nil {
-		m.fail(book, startPos, err)
+		m.fail(session.id, book, startPos, err)
 		return
 	}
 	defer file.Close()
 
 	if _, err := file.Seek(startPos, io.SeekStart); err != nil {
-		m.fail(book, startPos, err)
+		m.fail(session.id, book, startPos, err)
 		return
 	}
 
 	reader, err := NewStreamingChunkReader(file, startPos, chunkSize)
 	if err != nil {
-		m.fail(book, startPos, err)
+		m.fail(session.id, book, startPos, err)
 		return
 	}
-	engine := m.engines(Config{
-		BookFile:   book.Path,
-		SaveFile:   book.SaveFile,
-		Voice:      voice,
-		ChunkSize:  chunkSize,
-		TTSTimeout: m.ttsTimeout,
-	})
 
 	for {
-		if !m.waitUntilPlayable(ctx) {
+		if !m.waitUntilPlayable(session) {
 			return
 		}
 
 		chunk, err := reader.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				m.finish(book)
+				m.finish(session.id, book)
 				return
 			}
-			m.fail(book, m.current(), err)
+			m.fail(session.id, book, m.current(), err)
 			return
 		}
 
-		m.updateProgress("chunk.started", chunk.StartByte)
-		if err := engine.Speak(ctx, chunk.Text); err != nil {
-			_ = saveBookProgress(book, chunk.StartByte)
-			m.fail(book, chunk.StartByte, err)
+		m.updateProgress(session.id, "chunk.started", chunk.StartByte)
+		if err := session.engine.Speak(session.ctx, chunk.Text); err != nil {
+			if session.ctx.Err() != nil {
+				return
+			}
+			m.fail(session.id, book, chunk.StartByte, err)
 			return
 		}
-		if ctx.Err() != nil {
+		if session.ctx.Err() != nil {
 			return
 		}
-		if err := saveBookProgress(book, chunk.EndByte); err != nil {
-			m.fail(book, chunk.StartByte, err)
+		if err := m.progress.Save(book, chunk.EndByte); err != nil {
+			m.fail(session.id, book, chunk.StartByte, fmt.Errorf("save progress: %w", err))
 			return
 		}
-		m.updateProgress("progress.updated", chunk.EndByte)
+		m.updateProgress(session.id, "progress.updated", chunk.EndByte)
 	}
 }
 
-func (m *PlaybackManager) waitUntilPlayable(ctx context.Context) bool {
+func (m *PlaybackManager) waitUntilPlayable(session *playbackSession) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for m.state == playbackPaused && ctx.Err() == nil {
+	for m.state == playbackPaused && session.ctx.Err() == nil && m.active == session {
 		m.cond.Wait()
 	}
-	return ctx.Err() == nil && m.state == playbackPlaying
+	return session.ctx.Err() == nil && m.state == playbackPlaying && m.active == session
 }
 
 func (m *PlaybackManager) current() int64 {
@@ -521,8 +809,12 @@ func (m *PlaybackManager) current() int64 {
 	return m.currentByte
 }
 
-func (m *PlaybackManager) updateProgress(eventType string, pos int64) {
+func (m *PlaybackManager) updateProgress(sessionID uint64, eventType string, pos int64) {
 	m.mu.Lock()
+	if m.active == nil || m.active.id != sessionID {
+		m.mu.Unlock()
+		return
+	}
 	if m.state != playbackPlaying && m.state != playbackPaused {
 		m.mu.Unlock()
 		return
@@ -534,36 +826,81 @@ func (m *PlaybackManager) updateProgress(eventType string, pos int64) {
 	m.publish(eventType, snapshot)
 }
 
-func (m *PlaybackManager) finish(book Book) {
-	_ = saveBookProgress(book, 0)
+func (m *PlaybackManager) finish(sessionID uint64, book Book) {
+	if !m.isActiveSession(sessionID) {
+		return
+	}
+
+	if err := m.progress.Reset(book); err != nil {
+		m.completeWithPersistenceFailure(sessionID, book.Size, fmt.Errorf("playback completed but progress reset failed: %w", err))
+		return
+	}
 
 	m.mu.Lock()
+	if !m.sessionIsActiveLocked(sessionID) || m.state == playbackStopped {
+		m.mu.Unlock()
+		return
+	}
 	m.state = playbackFinished
 	m.currentByte = book.Size
 	m.errMessage = ""
-	m.cancel = nil
+	m.active = nil
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
 
 	m.publish("playback.finished", snapshot)
 }
 
-func (m *PlaybackManager) fail(book Book, pos int64, err error) {
-	_ = saveBookProgress(book, pos)
+func (m *PlaybackManager) fail(sessionID uint64, book Book, pos int64, err error) {
+	if !m.isActiveSession(sessionID) {
+		return
+	}
+
+	finalErr := errors.Join(err, m.progress.Save(book, pos))
 
 	m.mu.Lock()
-	if m.state == playbackStopped {
+	if !m.sessionIsActiveLocked(sessionID) || m.state == playbackStopped {
+		m.mu.Unlock()
+		return
+	}
+	m.state = playbackFailed
+	m.currentByte = pos
+	if finalErr != nil {
+		m.errMessage = finalErr.Error()
+	} else {
+		m.errMessage = ""
+	}
+	m.active = nil
+	snapshot := m.snapshotLocked()
+	m.mu.Unlock()
+
+	m.publish("playback.failed", snapshot)
+}
+
+func (m *PlaybackManager) completeWithPersistenceFailure(sessionID uint64, pos int64, err error) {
+	m.mu.Lock()
+	if !m.sessionIsActiveLocked(sessionID) || m.state == playbackStopped {
 		m.mu.Unlock()
 		return
 	}
 	m.state = playbackFailed
 	m.currentByte = pos
 	m.errMessage = err.Error()
-	m.cancel = nil
+	m.active = nil
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
 
 	m.publish("playback.failed", snapshot)
+}
+
+func (m *PlaybackManager) isActiveSession(sessionID uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sessionIsActiveLocked(sessionID) && m.state != playbackStopped
+}
+
+func (m *PlaybackManager) sessionIsActiveLocked(sessionID uint64) bool {
+	return m.active != nil && m.active.id == sessionID
 }
 
 func (m *PlaybackManager) snapshotLocked() PlaybackSnapshot {
@@ -587,7 +924,7 @@ func (m *PlaybackManager) publish(eventType string, snapshot PlaybackSnapshot) {
 	})
 }
 
-func loadBookProgress(book Book) (int64, error) {
+func (JSONProgressStore) Load(book Book, currentSize int64) (int64, error) {
 	data, err := os.ReadFile(book.SaveFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -603,32 +940,43 @@ func loadBookProgress(book Book) (int64, error) {
 	if progress.Unit != PositionUnit {
 		return 0, fmt.Errorf("incompatible progress unit %q", progress.Unit)
 	}
-	if progress.LastPosition < 0 || progress.LastPosition > book.Size {
-		return 0, fmt.Errorf("saved position is outside the book")
+	if progress.LastPosition < 0 || progress.LastPosition > currentSize {
+		return 0, ErrPositionOutsideBook
 	}
-	ok, err := isFileUTF8Boundary(book.Path, progress.LastPosition, book.Size)
+	ok, err := isFileUTF8Boundary(book.Path, progress.LastPosition, currentSize)
 	if err != nil {
 		return 0, err
 	}
 	if !ok {
-		return 0, fmt.Errorf("saved position is inside a UTF-8 character")
+		return 0, ErrPositionInsideRune
 	}
-	if progress.LastPosition == book.Size {
+	if progress.LastPosition == currentSize {
 		return 0, nil
 	}
 	return progress.LastPosition, nil
 }
 
-func saveBookProgress(book Book, pos int64) error {
+func (JSONProgressStore) Save(book Book, pos int64) error {
 	data, err := json.Marshal(Progress{LastPosition: pos, Unit: PositionUnit})
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal progress: %w", err)
 	}
-	return writeFileReplace(book.SaveFile, data, 0644)
+	if err := writeFileReplace(book.SaveFile, data, 0644); err != nil {
+		return fmt.Errorf("replace progress file: %w", err)
+	}
+	return nil
 }
 
-func NewLocalAPI(store *BookStore, playback *PlaybackManager, engines engineFactory) *LocalAPI {
-	return &LocalAPI{store: store, playback: playback, engines: engines}
+func (s JSONProgressStore) Reset(book Book) error {
+	return s.Save(book, 0)
+}
+
+func saveBookProgress(book Book, pos int64) error {
+	return JSONProgressStore{}.Save(book, pos)
+}
+
+func NewLocalAPI(store *BookStore, playback *PlaybackManager, engines engineFactory, token string) *LocalAPI {
+	return &LocalAPI{store: store, playback: playback, engines: engines, token: token}
 }
 
 func (api *LocalAPI) Routes() http.Handler {
@@ -647,9 +995,18 @@ func (api *LocalAPI) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/events", api.handleEvents)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		if !isLoopbackHost(r.Host) {
+			writeError(w, http.StatusForbidden, "forbidden", "Host must be a loopback address")
+			return
+		}
+		if !isAllowedOrigin(r) {
+			writeError(w, http.StatusForbidden, "forbidden", "Origin is not allowed")
+			return
+		}
+		if api.requiresToken(r) && !api.authorized(r) {
+			writeError(w, http.StatusUnauthorized, "api_token_required", "API token is required")
+			return
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -675,7 +1032,7 @@ func (api *LocalAPI) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 func (api *LocalAPI) handleVoices(w http.ResponseWriter, r *http.Request) {
 	voices, err := api.engines(Config{}).Voices(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string][]Voice{"voices": voices})
@@ -684,43 +1041,39 @@ func (api *LocalAPI) handleVoices(w http.ResponseWriter, r *http.Request) {
 func (api *LocalAPI) handleAddBook(w http.ResponseWriter, r *http.Request) {
 	var req AddBookRequest
 	if err := readJSON(w, r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeAPIError(w, err)
 		return
 	}
 	book, err := api.store.Add(req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, book)
+	writeJSON(w, http.StatusCreated, publicBook(book))
 }
 
 func (api *LocalAPI) handleListBooks(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string][]Book{"books": api.store.List()})
+	writeJSON(w, http.StatusOK, map[string][]PublicBook{"books": publicBooks(api.store.List())})
 }
 
 func (api *LocalAPI) handleStartPlayback(w http.ResponseWriter, r *http.Request) {
 	var req StartPlaybackRequest
 	if err := readJSON(w, r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeAPIError(w, err)
 		return
 	}
-	if req.BookID == "" {
-		writeError(w, http.StatusBadRequest, "book_id is required")
+	if _, err := validateStartPlaybackRequest(req); err != nil {
+		writeAPIError(w, err)
 		return
 	}
 	book, ok := api.store.Get(req.BookID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "book not found")
+		writeAPIError(w, ErrBookNotFound)
 		return
 	}
 	snapshot, err := api.playback.Start(book, req)
 	if err != nil {
-		if strings.Contains(err.Error(), "already active") {
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		}
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeAPIError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, snapshot)
@@ -733,7 +1086,7 @@ func (api *LocalAPI) handlePlaybackState(w http.ResponseWriter, r *http.Request)
 func (api *LocalAPI) handlePausePlayback(w http.ResponseWriter, r *http.Request) {
 	snapshot, err := api.playback.Pause()
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		writeAPIError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
@@ -742,38 +1095,43 @@ func (api *LocalAPI) handlePausePlayback(w http.ResponseWriter, r *http.Request)
 func (api *LocalAPI) handleResumePlayback(w http.ResponseWriter, r *http.Request) {
 	snapshot, err := api.playback.Resume()
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		writeAPIError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func (api *LocalAPI) handleStopPlayback(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, api.playback.Stop())
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	snapshot, err := api.playback.Stop(ctx)
+	if err != nil {
+		writePlaybackError(w, err, snapshot)
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func (api *LocalAPI) handleSetPosition(w http.ResponseWriter, r *http.Request) {
 	var req SetPositionRequest
 	if err := readJSON(w, r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeAPIError(w, err)
 		return
 	}
-	if req.BookID == "" {
-		writeError(w, http.StatusBadRequest, "book_id is required")
+	pos, err := validateSetPositionRequest(req)
+	if err != nil {
+		writeAPIError(w, err)
 		return
 	}
 	book, ok := api.store.Get(req.BookID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "book not found")
+		writeAPIError(w, ErrBookNotFound)
 		return
 	}
-	snapshot, err := api.playback.SetPosition(book, req.CurrentByte)
+	snapshot, err := api.playback.SetPosition(book, pos)
 	if err != nil {
-		if strings.Contains(err.Error(), "active") {
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		}
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeAPIError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
@@ -782,7 +1140,7 @@ func (api *LocalAPI) handleSetPosition(w http.ResponseWriter, r *http.Request) {
 func (api *LocalAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming is not supported")
+		writeError(w, http.StatusInternalServerError, "streaming_not_supported", "streaming is not supported")
 		return
 	}
 
@@ -893,11 +1251,14 @@ const localDashboardHTML = `<!doctype html>
 <script>
 let currentBookId = "";
 const $ = (id) => document.getElementById(id);
+const apiToken = new URLSearchParams(location.search).get("token") || "";
 
 async function api(path, options = {}) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (apiToken) headers["X-TTS-Token"] = apiToken;
   const response = await fetch(path, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+    headers
   });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
@@ -963,7 +1324,7 @@ $("setPosition").onclick = async () => {
   }));
 };
 
-const source = new EventSource("/api/v1/events");
+const source = new EventSource("/api/v1/events" + (apiToken ? "?token=" + encodeURIComponent(apiToken) : ""));
 ["playback.started", "chunk.started", "progress.updated", "playback.paused", "playback.resumed", "playback.stopped", "playback.finished", "playback.failed", "position.updated"].forEach((name) => {
   source.addEventListener(name, (event) => {
     const data = JSON.parse(event.data);
@@ -979,16 +1340,19 @@ window.addEventListener("unhandledrejection", (event) => log("error " + event.re
 </html>`
 
 func readJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	if err := requireJSONContentType(r); err != nil {
+		return err
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
 	defer r.Body.Close()
 
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrInvalidJSON, err)
 	}
 	if decoder.Decode(&struct{}{}) != io.EOF {
-		return fmt.Errorf("request body must contain a single JSON object")
+		return fmt.Errorf("%w: request body must contain a single JSON object", ErrInvalidJSON)
 	}
 	return nil
 }
@@ -999,6 +1363,84 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
+func writeError(w http.ResponseWriter, status int, code string, message string) {
+	writeJSON(w, status, ErrorResponse{Code: code, Error: message})
+}
+
+func writeAPIError(w http.ResponseWriter, err error) {
+	writeJSON(w, statusForError(err), ErrorResponse{
+		Code:  codeForError(err),
+		Error: err.Error(),
+	})
+}
+
+func writePlaybackError(w http.ResponseWriter, err error, snapshot PlaybackSnapshot) {
+	writeJSON(w, statusForError(err), ErrorResponse{
+		Code:     codeForError(err),
+		Error:    err.Error(),
+		Playback: &snapshot,
+	})
+}
+
+func statusForError(err error) int {
+	switch {
+	case errors.Is(err, ErrPlaybackActive),
+		errors.Is(err, ErrBookModified),
+		errors.Is(err, ErrPlaybackNotPlaying),
+		errors.Is(err, ErrPlaybackNotPaused):
+		return http.StatusConflict
+	case errors.Is(err, ErrBookNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, ErrUnsupportedMedia):
+		return http.StatusUnsupportedMediaType
+	case errors.Is(err, ErrPathRequired),
+		errors.Is(err, ErrBookNotReadable),
+		errors.Is(err, ErrBookNotRegular),
+		errors.Is(err, ErrBookIDRequired),
+		errors.Is(err, ErrCurrentByteRequired),
+		errors.Is(err, ErrPositionOutsideBook),
+		errors.Is(err, ErrPositionInsideRune),
+		errors.Is(err, ErrInvalidChunkSize),
+		errors.Is(err, ErrInvalidJSON):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func codeForError(err error) string {
+	switch {
+	case errors.Is(err, ErrPlaybackActive):
+		return "playback_active"
+	case errors.Is(err, ErrPlaybackNotPlaying):
+		return "playback_not_playing"
+	case errors.Is(err, ErrPlaybackNotPaused):
+		return "playback_not_paused"
+	case errors.Is(err, ErrBookModified):
+		return "book_modified"
+	case errors.Is(err, ErrBookNotFound):
+		return "book_not_found"
+	case errors.Is(err, ErrBookNotReadable):
+		return "book_not_readable"
+	case errors.Is(err, ErrBookNotRegular):
+		return "book_not_regular"
+	case errors.Is(err, ErrPathRequired):
+		return "path_required"
+	case errors.Is(err, ErrBookIDRequired):
+		return "book_id_required"
+	case errors.Is(err, ErrCurrentByteRequired):
+		return "current_byte_required"
+	case errors.Is(err, ErrPositionOutsideBook):
+		return "position_outside_book"
+	case errors.Is(err, ErrPositionInsideRune):
+		return "position_inside_utf8_rune"
+	case errors.Is(err, ErrInvalidChunkSize):
+		return "invalid_chunk_size"
+	case errors.Is(err, ErrUnsupportedMedia):
+		return "unsupported_media_type"
+	case errors.Is(err, ErrInvalidJSON):
+		return "invalid_json"
+	default:
+		return "internal_error"
+	}
 }

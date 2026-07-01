@@ -2,20 +2,25 @@ openapi: 3.1.0
 info:
   title: Audiobook TTS Reader Local API
   version: 1.0.0
-  description: Local loopback API for controlling Windows SAPI audiobook playback.
+  description: Local loopback API for controlling Windows SAPI audiobook playback. Mutating requests require the per-run API token printed by `tts-reader serve`.
 servers:
   - url: http://127.0.0.1:8080
 tags:
   - name: Voices
+    description: Installed local Windows SAPI voices.
   - name: Books
+    description: Local text files registered for the current API process.
   - name: Playback
+    description: Audiobook playback lifecycle and progress controls.
   - name: Events
+    description: OpenAPI document and Server-Sent Events stream.
 paths:
   /api/openapi.yaml:
     get:
       tags: [Events]
       operationId: getOpenAPISpec
       summary: Get this OpenAPI contract
+      security: []
       responses:
         "200":
           description: OpenAPI YAML document
@@ -23,12 +28,15 @@ paths:
             application/yaml:
               schema:
                 type: string
+        "403":
+          $ref: "#/components/responses/Error"
 
   /api/v1/voices:
     get:
       tags: [Voices]
       operationId: listVoices
       summary: List installed Windows SAPI voices
+      security: []
       responses:
         "200":
           description: Installed voices
@@ -36,6 +44,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/VoicesResponse"
+        "403":
+          $ref: "#/components/responses/Error"
         "500":
           $ref: "#/components/responses/Error"
 
@@ -44,6 +54,9 @@ paths:
       tags: [Books]
       operationId: addBook
       summary: Register a local text book
+      security:
+        - ApiTokenHeader: []
+        - ApiTokenQuery: []
       requestBody:
         required: true
         content:
@@ -59,10 +72,15 @@ paths:
                 $ref: "#/components/schemas/Book"
         "400":
           $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
     get:
       tags: [Books]
       operationId: listBooks
       summary: List registered books for the current process
+      security: []
       responses:
         "200":
           description: Registered books
@@ -70,12 +88,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BooksResponse"
+        "403":
+          $ref: "#/components/responses/Error"
 
   /api/v1/playback:
     post:
       tags: [Playback]
       operationId: startPlayback
       summary: Start audiobook playback
+      security:
+        - ApiTokenHeader: []
+        - ApiTokenQuery: []
       requestBody:
         required: true
         content:
@@ -95,10 +118,15 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
     get:
       tags: [Playback]
       operationId: getPlaybackState
       summary: Get current playback state
+      security: []
       responses:
         "200":
           description: Current playback state
@@ -106,12 +134,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PlaybackState"
+        "403":
+          $ref: "#/components/responses/Error"
 
   /api/v1/playback/pause:
     post:
       tags: [Playback]
       operationId: pausePlayback
       summary: Pause playback between chunks
+      security:
+        - ApiTokenHeader: []
+        - ApiTokenQuery: []
       responses:
         "200":
           description: Paused state
@@ -121,12 +154,17 @@ paths:
                 $ref: "#/components/schemas/PlaybackState"
         "409":
           $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
 
   /api/v1/playback/resume:
     post:
       tags: [Playback]
       operationId: resumePlayback
       summary: Resume paused playback
+      security:
+        - ApiTokenHeader: []
+        - ApiTokenQuery: []
       responses:
         "200":
           description: Playing state
@@ -136,12 +174,17 @@ paths:
                 $ref: "#/components/schemas/PlaybackState"
         "409":
           $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
 
   /api/v1/playback/stop:
     post:
       tags: [Playback]
       operationId: stopPlayback
       summary: Stop playback and persist the current byte position
+      security:
+        - ApiTokenHeader: []
+        - ApiTokenQuery: []
       responses:
         "200":
           description: Stopped state
@@ -149,12 +192,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PlaybackState"
+        "401":
+          $ref: "#/components/responses/Error"
+        "500":
+          description: Playback stopped, but engine stop or progress persistence returned an error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/playback/position:
     put:
       tags: [Playback]
       operationId: setPlaybackPosition
       summary: Persist a new byte position for a registered book
+      security:
+        - ApiTokenHeader: []
+        - ApiTokenQuery: []
       requestBody:
         required: true
         content:
@@ -174,12 +228,19 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "415":
+          $ref: "#/components/responses/Error"
 
   /api/v1/events:
     get:
       tags: [Events]
       operationId: streamEvents
       summary: Stream playback events with Server-Sent Events
+      security:
+        - ApiTokenHeader: []
+        - ApiTokenQuery: []
       responses:
         "200":
           description: SSE stream
@@ -189,10 +250,24 @@ paths:
                 type: string
                 examples:
                   - "event: progress.updated\ndata: {\"type\":\"progress.updated\"}\n\n"
+        "401":
+          $ref: "#/components/responses/Error"
         "500":
           $ref: "#/components/responses/Error"
 
 components:
+  securitySchemes:
+    ApiTokenHeader:
+      type: apiKey
+      in: header
+      name: X-TTS-Token
+      description: Per-run local API token printed by `tts-reader serve`.
+    ApiTokenQuery:
+      type: apiKey
+      in: query
+      name: token
+      description: Query token used by the built-in browser dashboard and SSE connections.
+
   responses:
     Error:
       description: Error response
@@ -233,32 +308,22 @@ components:
         title:
           type: string
           examples: ["Novel"]
-        save_file:
-          type: string
-          description: Optional JSON progress file path.
-          examples: ["C:\\Books\\novel.progress.json"]
 
     Book:
       type: object
       additionalProperties: false
-      required: [id, title, path, save_file, size, created_at]
+      description: Public book metadata. Filesystem paths and progress files are internal and are never returned by the API.
+      required: [id, title, size]
       properties:
         id:
           type: string
           examples: ["book-1"]
         title:
           type: string
-        path:
-          type: string
-        save_file:
-          type: string
         size:
           type: integer
           format: int64
           minimum: 0
-        created_at:
-          type: string
-          format: date-time
 
     BooksResponse:
       type: object
@@ -284,6 +349,7 @@ components:
         chunk_size:
           type: integer
           minimum: 1
+          maximum: 10000
           default: 250
 
     SetPositionRequest:
@@ -353,7 +419,12 @@ components:
     ErrorResponse:
       type: object
       additionalProperties: false
-      required: [error]
+      required: [code, error]
       properties:
+        code:
+          type: string
+          examples: ["book_modified"]
         error:
           type: string
+        playback:
+          $ref: "#/components/schemas/PlaybackState"
