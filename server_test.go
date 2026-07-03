@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,6 +76,53 @@ func TestLocalAPIServesDashboard(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "openapi: 3.1.0") {
 		t.Fatalf("OpenAPI відповідь не схожа на YAML contract")
+	}
+}
+
+func TestServerShutdownWithOpenSSE(t *testing.T) {
+	api := newTestLocalAPI(t, nil)
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	defer cancelServe()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("не вдалося відкрити test listener: %v", err)
+	}
+
+	server := newLocalHTTPServer(listener.Addr().String(), api.Routes(), serveCtx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Serve(listener)
+	}()
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/api/v1/events?token=test-token")
+	if err != nil {
+		t.Fatalf("не вдалося відкрити SSE stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("очікував 200 для SSE, отримав %d", resp.StatusCode)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		cancelServe()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		done <- server.Shutdown(ctx)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown заблокувався на відкритому SSE stream: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown заблокувався на відкритому SSE stream")
+	}
+
+	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("неочікувана помилка server.Serve: %v", err)
 	}
 }
 
@@ -581,6 +629,51 @@ func TestStartRejectsBookWithSameSizeButChangedContent(t *testing.T) {
 
 	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{BookID: book.ID})
 	assertErrorCode(t, rec, http.StatusConflict, "book_modified")
+}
+
+func TestSetPositionRejectsTruncatedBook(t *testing.T) {
+	bookPath := writeTempBook(t, "ABCDEF")
+	book := mustAddBook(t, bookPath)
+	if err := os.WriteFile(bookPath, []byte("ABC"), 0644); err != nil {
+		t.Fatalf("не вдалося скоротити книгу: %v", err)
+	}
+
+	manager := NewPlaybackManager(func(cfg Config) TTSEngine { return &testEngine{} }, time.Second, NewEventBroker())
+	_, err := manager.SetPosition(book, 6)
+	if !errors.Is(err, ErrBookModified) {
+		t.Fatalf("очікував ErrBookModified, отримав %v", err)
+	}
+}
+
+func TestSetPositionRejectsExtendedBook(t *testing.T) {
+	bookPath := writeTempBook(t, "ABC")
+	book := mustAddBook(t, bookPath)
+	if err := os.WriteFile(bookPath, []byte("ABCDEF"), 0644); err != nil {
+		t.Fatalf("не вдалося розширити книгу: %v", err)
+	}
+
+	manager := NewPlaybackManager(func(cfg Config) TTSEngine { return &testEngine{} }, time.Second, NewEventBroker())
+	_, err := manager.SetPosition(book, 3)
+	if !errors.Is(err, ErrBookModified) {
+		t.Fatalf("очікував ErrBookModified, отримав %v", err)
+	}
+}
+
+func TestSetPositionRejectsSameSizeModifiedBook(t *testing.T) {
+	bookPath := writeTempBook(t, "ABCDEF")
+	book := mustAddBook(t, bookPath)
+	if err := os.WriteFile(bookPath, []byte("UVWXYZ"), 0644); err != nil {
+		t.Fatalf("не вдалося змінити книгу: %v", err)
+	}
+	if err := os.Chtimes(bookPath, book.File.ModifiedAt, book.File.ModifiedAt); err != nil {
+		t.Fatalf("не вдалося повернути mtime книги: %v", err)
+	}
+
+	manager := NewPlaybackManager(func(cfg Config) TTSEngine { return &testEngine{} }, time.Second, NewEventBroker())
+	_, err := manager.SetPosition(book, 3)
+	if !errors.Is(err, ErrBookModified) {
+		t.Fatalf("очікував ErrBookModified, отримав %v", err)
+	}
 }
 
 func TestBookStoreRejectsDirectory(t *testing.T) {

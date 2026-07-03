@@ -221,12 +221,9 @@ func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactor
 		return 1
 	}
 	api := NewLocalAPI(NewBookStore(), NewPlaybackManager(engines, cfg.TTSTimeout, events), engines, token)
-	server := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           api.Routes(),
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	defer cancelServe()
+	server := newLocalHTTPServer(cfg.Addr, api.Routes(), serveCtx)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -243,10 +240,17 @@ func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactor
 
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = api.playback.Stop(shutdownCtx)
-		if err := server.Shutdown(shutdownCtx); err != nil {
+		cancelServe()
+
+		playbackCtx, cancelPlayback := context.WithTimeout(context.Background(), 10*time.Second)
+		_, playbackErr := api.playback.Stop(playbackCtx)
+		cancelPlayback()
+
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownErr := server.Shutdown(shutdownCtx)
+		cancelShutdown()
+
+		if err := errors.Join(playbackErr, shutdownErr); err != nil {
 			fmt.Fprintf(stderr, "Помилка: не вдалося коректно зупинити HTTP API: %v\n", err)
 			return 1
 		}
@@ -258,6 +262,21 @@ func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactor
 		fmt.Fprintf(stderr, "Помилка: HTTP API завершився з помилкою: %v\n", err)
 		return 1
 	}
+}
+
+func newLocalHTTPServer(addr string, handler http.Handler, baseCtx context.Context) *http.Server {
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	if baseCtx != nil {
+		server.BaseContext = func(net.Listener) context.Context {
+			return baseCtx
+		}
+	}
+	return server
 }
 
 func waitHTTPServer(stderr io.Writer, errCh <-chan error) int {
@@ -707,10 +726,20 @@ func (m *PlaybackManager) SetPosition(book Book, pos int64) (PlaybackSnapshot, e
 	}
 	m.mu.Unlock()
 
-	if pos < 0 || pos > book.Size {
+	currentFile, err := inspectBookFile(book.Path)
+	if err != nil {
+		return PlaybackSnapshot{}, fmt.Errorf("inspect current book file: %w", err)
+	}
+	if !sameBookFile(book.File, currentFile) {
+		return PlaybackSnapshot{}, fmt.Errorf("%w: book file changed after registration", ErrBookModified)
+	}
+	book.Size = currentFile.Size
+	book.File = currentFile
+
+	if pos < 0 || pos > currentFile.Size {
 		return PlaybackSnapshot{}, ErrPositionOutsideBook
 	}
-	ok, err := isFileUTF8Boundary(book.Path, pos, book.Size)
+	ok, err := isFileUTF8Boundary(book.Path, pos, currentFile.Size)
 	if err != nil {
 		return PlaybackSnapshot{}, fmt.Errorf("check UTF-8 boundary: %w", err)
 	}
