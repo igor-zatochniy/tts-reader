@@ -105,6 +105,54 @@ func TestRunRejectsProgressInsideUTF8Rune(t *testing.T) {
 	}
 }
 
+func TestWriteFileReplaceReplacesProgressAndCleansTemp(t *testing.T) {
+	dir := t.TempDir()
+	save := filepath.Join(dir, "book_save.json")
+	mustWriteFile(t, save, "old-progress")
+
+	if err := writeFileReplace(save, []byte("new-progress"), 0644); err != nil {
+		t.Fatalf("не вдалося замінити progress: %v", err)
+	}
+
+	data, err := os.ReadFile(save)
+	if err != nil {
+		t.Fatalf("не вдалося прочитати progress: %v", err)
+	}
+	if string(data) != "new-progress" {
+		t.Fatalf("progress не оновився: %q", data)
+	}
+	assertNoProgressTemps(t, dir, save)
+}
+
+func TestWriteFileReplaceKeepsTargetWhenReplaceFails(t *testing.T) {
+	dir := t.TempDir()
+	save := filepath.Join(dir, "book_save.json")
+	mustWriteFile(t, save, "old-progress")
+	replaceErr := errors.New("replace failed")
+
+	err := writeFileReplaceWith(save, []byte("new-progress"), 0644, func(tmpName string, targetName string) error {
+		if targetName != save {
+			t.Fatalf("неочікуваний target: %q", targetName)
+		}
+		if _, err := os.Stat(tmpName); err != nil {
+			t.Fatalf("temp-файл має існувати перед replace: %v", err)
+		}
+		return replaceErr
+	})
+	if !errors.Is(err, replaceErr) {
+		t.Fatalf("очікував replaceErr, отримав %v", err)
+	}
+
+	data, err := os.ReadFile(save)
+	if err != nil {
+		t.Fatalf("не вдалося прочитати старий progress: %v", err)
+	}
+	if string(data) != "old-progress" {
+		t.Fatalf("старий progress не має втрачатися після помилки replace: %q", data)
+	}
+	assertNoProgressTemps(t, dir, save)
+}
+
 func TestRunUsesStartPhraseAndResetsProgressAfterSuccess(t *testing.T) {
 	dir := t.TempDir()
 	book := filepath.Join(dir, "book.txt")
@@ -281,6 +329,17 @@ func mustWriteProgress(t *testing.T, path string, progress Progress) {
 	}
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatalf("не вдалося записати прогрес: %v", err)
+	}
+}
+
+func assertNoProgressTemps(t *testing.T, dir string, target string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, "."+filepath.Base(target)+".tmp-*"))
+	if err != nil {
+		t.Fatalf("не вдалося перевірити temp-файли: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("неочікувані temp-файли progress: %#v", matches)
 	}
 }
 

@@ -315,6 +315,10 @@ func (a *App) saveProgress(pos int64) error {
 
 // Запис через тимчасовий файл зменшує ризик пошкодити JSON прогресу під час збою процесу.
 func writeFileReplace(path string, data []byte, perm os.FileMode) error {
+	return writeFileReplaceWith(path, data, perm, replaceProgressFile)
+}
+
+func writeFileReplaceWith(path string, data []byte, perm os.FileMode, replace func(string, string) error) error {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
 	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
@@ -338,17 +342,16 @@ func writeFileReplace(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 
-	if err := os.Rename(tmpName, path); err != nil {
-		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return err
-		}
-		if retryErr := os.Rename(tmpName, path); retryErr != nil {
-			return retryErr
-		}
+	if err := replace(tmpName, path); err != nil {
+		return err
 	}
 
 	keepTemp = false
