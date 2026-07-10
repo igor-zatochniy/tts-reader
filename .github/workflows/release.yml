@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          go build -trimpath -ldflags "-s -w" -o dist/tts-reader-windows-amd64.exe .
+
+      - name: Create SHA256 checksum
+        shell: pwsh
+        run: |
+          $exe = "dist/tts-reader-windows-amd64.exe"
+          $checksum = "dist/tts-reader-windows-amd64.exe.sha256"
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  tts-reader-windows-amd64.exe" | Set-Content -Path $checksum -Encoding ascii -NoNewline
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $notes = @"
+          Windows amd64 build for Audiobook TTS Reader.
+
+          Assets:
+          - tts-reader-windows-amd64.exe
+          - tts-reader-windows-amd64.exe.sha256
+          "@
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --notes $notes
+          }
+
+          gh release upload $tag `
+            dist/tts-reader-windows-amd64.exe `
+            dist/tts-reader-windows-amd64.exe.sha256 `
+            --clobber

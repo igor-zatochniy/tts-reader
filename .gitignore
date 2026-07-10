@@ -12,6 +12,8 @@ book_save.json
 .*.tmp-*
 
 # Профілі та benchmark-артефакти
+dist/
+*.sha256
 cpu.out
 mem.out
 *.prof
