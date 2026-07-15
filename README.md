@@ -1,4 +1,4 @@
-# Audiobook TTS CLI
+# Audiobook TTS Reader
 
 Консольний інструмент на Go для озвучення текстових книг у Windows Desktop із автоматичним збереженням прогресу.
 
@@ -40,6 +40,29 @@ Next chunk
 - Windows 10/11.
 - Go 1.25.12 або сумісний patched toolchain.
 - PowerShell із доступом до `System.Speech`.
+
+## Releases
+
+GitHub Release створюється автоматично після push tag у форматі `v*`:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Workflow `.github/workflows/release.yml` збирає Windows amd64 binary і додає до Release два файли:
+
+```text
+tts-reader-windows-amd64.exe
+tts-reader-windows-amd64.exe.sha256
+```
+
+Перевірка checksum після завантаження:
+
+```powershell
+Get-FileHash .\tts-reader-windows-amd64.exe -Algorithm SHA256
+Get-Content .\tts-reader-windows-amd64.exe.sha256
+```
 
 ## Запуск із вихідного коду
 
@@ -292,6 +315,12 @@ Benchmark matrix містить ASCII і UTF-8 книги розміром 1 MB,
 
 GitHub Actions workflow у `.github/workflows/ci.yml` запускається на `windows-latest` і перевіряє форматування, OpenAPI contract, модулі, тести, race detector, `go vet`, `staticcheck`, `govulncheck` та збірку.
 
+Release workflow у `.github/workflows/release.yml` запускається на tags `v*`, збирає `tts-reader-windows-amd64.exe`, створює SHA256 checksum і публікує обидва артефакти в GitHub Release.
+
 ## Файли користувача
 
 `book.txt`, `book_save.json` і зібрані бінарні файли не мають потрапляти в репозиторій. Вони додані до `.gitignore`.
+
+## Ліцензія
+
+Проєкт поширюється за умовами MIT License. Деталі дивись у файлі `LICENSE`.
