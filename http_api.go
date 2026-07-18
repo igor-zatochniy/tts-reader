@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -315,18 +316,64 @@ func writeError(w http.ResponseWriter, status int, code string, message string) 
 }
 
 func writeAPIError(w http.ResponseWriter, err error) {
+	logInternalError("http api", err)
 	writeJSON(w, statusForError(err), ErrorResponse{
 		Code:  codeForError(err),
-		Error: err.Error(),
+		Error: publicErrorMessageForError(err),
 	})
 }
 
 func writePlaybackError(w http.ResponseWriter, err error, snapshot PlaybackSnapshot) {
+	logInternalError("http api", err)
 	writeJSON(w, statusForError(err), ErrorResponse{
 		Code:     codeForError(err),
-		Error:    err.Error(),
+		Error:    publicErrorMessageForError(err),
 		Playback: &snapshot,
 	})
+}
+
+func publicErrorMessageForError(err error) string {
+	switch {
+	case errors.Is(err, ErrPlaybackActive):
+		return "playback is already active"
+	case errors.Is(err, ErrPlaybackNotPlaying):
+		return "playback is not playing"
+	case errors.Is(err, ErrPlaybackNotPaused):
+		return "playback is not paused"
+	case errors.Is(err, ErrBookModified):
+		return "book file changed after registration"
+	case errors.Is(err, ErrBookNotFound):
+		return "book not found"
+	case errors.Is(err, ErrBookNotReadable):
+		return "book is not readable"
+	case errors.Is(err, ErrBookNotRegular):
+		return "book must be a regular file"
+	case errors.Is(err, ErrPathRequired):
+		return "path is required"
+	case errors.Is(err, ErrBookIDRequired):
+		return "book_id is required"
+	case errors.Is(err, ErrCurrentByteRequired):
+		return "current_byte is required"
+	case errors.Is(err, ErrPositionOutsideBook):
+		return "position outside book"
+	case errors.Is(err, ErrPositionInsideRune):
+		return "position inside UTF-8 rune"
+	case errors.Is(err, ErrInvalidChunkSize):
+		return "invalid chunk_size"
+	case errors.Is(err, ErrUnsupportedMedia):
+		return "unsupported media type"
+	case errors.Is(err, ErrInvalidJSON):
+		return "invalid JSON request"
+	default:
+		return "internal server error"
+	}
+}
+
+func logInternalError(scope string, err error) {
+	if err == nil || statusForError(err) != http.StatusInternalServerError {
+		return
+	}
+	log.Printf("%s: %v", scope, err)
 }
 
 func statusForError(err error) int {

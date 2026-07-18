@@ -69,6 +69,9 @@ func TestLocalAPIServesDashboard(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "Audiobook TTS Reader") {
 		t.Fatalf("dashboard не містить назву застосунку")
 	}
+	if !strings.Contains(rec.Body.String(), `history.replaceState({}, document.title, "/")`) {
+		t.Fatalf("dashboard не прибирає token з адресного рядка")
+	}
 
 	rec = performJSON(t, api.Routes(), http.MethodGet, "/api/openapi.yaml", nil)
 	if rec.Code != http.StatusOK {
@@ -431,7 +434,7 @@ func TestStopReturnsProgressSaveError(t *testing.T) {
 	if !errors.Is(err, saveErr) {
 		t.Fatalf("очікував saveErr, отримав %v", err)
 	}
-	if snapshot.State != playbackStopped || snapshot.Error == "" {
+	if snapshot.State != playbackStopped || snapshot.Error != "internal server error" {
 		t.Fatalf("очікував stopped snapshot з помилкою, отримав %#v", snapshot)
 	}
 }
@@ -489,8 +492,8 @@ func TestFinishFailsWhenProgressResetFails(t *testing.T) {
 	}
 
 	snapshot := waitForManagerState(t, manager, playbackFailed)
-	if !strings.Contains(snapshot.Error, resetErr.Error()) {
-		t.Fatalf("помилка не містить resetErr: %#v", snapshot)
+	if snapshot.Error != "internal server error" || strings.Contains(snapshot.Error, resetErr.Error()) {
+		t.Fatalf("snapshot має містити лише безпечну помилку: %#v", snapshot)
 	}
 	manager.mu.Lock()
 	active := manager.active
@@ -500,7 +503,7 @@ func TestFinishFailsWhenProgressResetFails(t *testing.T) {
 	}
 }
 
-func TestPlaybackFailureIncludesProgressSaveError(t *testing.T) {
+func TestPlaybackFailureSanitizesInternalErrors(t *testing.T) {
 	playbackErr := errors.New("tts failed")
 	saveErr := errors.New("save failed")
 	manager := NewPlaybackManagerWithProgress(
@@ -523,8 +526,35 @@ func TestPlaybackFailureIncludesProgressSaveError(t *testing.T) {
 	}
 
 	snapshot := waitForManagerState(t, manager, playbackFailed)
-	if !strings.Contains(snapshot.Error, playbackErr.Error()) || !strings.Contains(snapshot.Error, saveErr.Error()) {
-		t.Fatalf("помилка не містить playback і save errors: %#v", snapshot)
+	if snapshot.Error != "internal server error" ||
+		strings.Contains(snapshot.Error, playbackErr.Error()) ||
+		strings.Contains(snapshot.Error, saveErr.Error()) {
+		t.Fatalf("snapshot leaked internal errors: %#v", snapshot)
+	}
+}
+
+func TestLocalAPISanitizesInternalErrors(t *testing.T) {
+	internalErr := errors.New(`C:\secret\book_save.json denied`)
+	engines := func(cfg Config) TTSEngine { return &testEngine{} }
+	api := NewLocalAPI(
+		NewBookStore(),
+		NewPlaybackManagerWithProgress(engines, time.Second, NewEventBroker(), &failingProgressStore{loadErr: internalErr}),
+		engines,
+		"test-token",
+	)
+	book := addTestBook(t, api, writeTempBook(t, "Книга."))
+
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{BookID: book.ID})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("очікував 500, отримав %d: %s", rec.Code, rec.Body.String())
+	}
+	var got ErrorResponse
+	decodeJSON(t, rec, &got)
+	if got.Code != "internal_error" || got.Error != "internal server error" {
+		t.Fatalf("очікував безпечну помилку, отримав %#v", got)
+	}
+	if strings.Contains(got.Error, "secret") || strings.Contains(got.Error, "denied") {
+		t.Fatalf("HTTP відповідь leaked internal error: %#v", got)
 	}
 }
 

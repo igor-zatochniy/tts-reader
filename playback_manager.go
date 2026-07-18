@@ -236,7 +236,8 @@ func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
 	}
 	m.state = playbackStopped
 	if stopErr != nil {
-		m.errMessage = stopErr.Error()
+		logInternalError("playback stop", stopErr)
+		m.errMessage = publicErrorMessageForError(stopErr)
 	} else {
 		m.errMessage = ""
 	}
@@ -419,6 +420,7 @@ func (m *PlaybackManager) fail(sessionID uint64, book Book, pos int64, err error
 	}
 
 	finalErr := errors.Join(err, m.progress.Save(book, pos))
+	logInternalError("playback failure", finalErr)
 
 	m.mu.Lock()
 	if !m.sessionIsActiveLocked(sessionID) || m.state == playbackStopped {
@@ -428,7 +430,7 @@ func (m *PlaybackManager) fail(sessionID uint64, book Book, pos int64, err error
 	m.state = playbackFailed
 	m.currentByte = pos
 	if finalErr != nil {
-		m.errMessage = finalErr.Error()
+		m.errMessage = publicErrorMessageForError(finalErr)
 	} else {
 		m.errMessage = ""
 	}
@@ -440,6 +442,8 @@ func (m *PlaybackManager) fail(sessionID uint64, book Book, pos int64, err error
 }
 
 func (m *PlaybackManager) completeWithPersistenceFailure(sessionID uint64, pos int64, err error) {
+	logInternalError("playback completion", err)
+
 	m.mu.Lock()
 	if !m.sessionIsActiveLocked(sessionID) || m.state == playbackStopped {
 		m.mu.Unlock()
@@ -447,7 +451,7 @@ func (m *PlaybackManager) completeWithPersistenceFailure(sessionID uint64, pos i
 	}
 	m.state = playbackFailed
 	m.currentByte = pos
-	m.errMessage = err.Error()
+	m.errMessage = publicErrorMessageForError(err)
 	m.active = nil
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
