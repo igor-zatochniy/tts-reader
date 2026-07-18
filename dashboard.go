@@ -80,6 +80,9 @@ const localDashboardHTML = `<!doctype html>
 let currentBookId = "";
 const $ = (id) => document.getElementById(id);
 const apiToken = new URLSearchParams(location.search).get("token") || "";
+if (apiToken) {
+  history.replaceState({}, document.title, "/");
+}
 
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
