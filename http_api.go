@@ -342,6 +342,10 @@ func publicErrorMessageForError(err error) string {
 		return "playback is not paused"
 	case errors.Is(err, ErrBookModified):
 		return "book file changed after registration"
+	case errors.Is(err, ErrProgressBookMismatch):
+		return "progress belongs to a different book"
+	case errors.Is(err, ErrProgressFormat):
+		return "unsupported progress format"
 	case errors.Is(err, ErrBookNotFound):
 		return "book not found"
 	case errors.Is(err, ErrBookNotReadable):
@@ -380,6 +384,8 @@ func statusForError(err error) int {
 	switch {
 	case errors.Is(err, ErrPlaybackActive),
 		errors.Is(err, ErrBookModified),
+		errors.Is(err, ErrProgressBookMismatch),
+		errors.Is(err, ErrProgressFormat),
 		errors.Is(err, ErrPlaybackNotPlaying),
 		errors.Is(err, ErrPlaybackNotPaused):
 		return http.StatusConflict
@@ -412,6 +418,10 @@ func codeForError(err error) string {
 		return "playback_not_paused"
 	case errors.Is(err, ErrBookModified):
 		return "book_modified"
+	case errors.Is(err, ErrProgressBookMismatch):
+		return "progress_book_mismatch"
+	case errors.Is(err, ErrProgressFormat):
+		return "progress_format_unsupported"
 	case errors.Is(err, ErrBookNotFound):
 		return "book_not_found"
 	case errors.Is(err, ErrBookNotReadable):

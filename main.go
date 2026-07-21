@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -18,14 +19,18 @@ import (
 const (
 	// Позиція прогресу зберігається в байтах, бо рядки Go індексуються байтовими зміщеннями.
 	PositionUnit      = "bytes (UTF-8)"
+	ProgressVersion   = 2
 	defaultChunkSize  = 250
 	defaultTTSTimeout = 2 * time.Minute
 	previewRuneLimit  = 70
 )
 
 type Progress struct {
-	LastPosition int64  `json:"last_position"`
-	Unit         string `json:"unit"`
+	Version         int    `json:"version"`
+	LastPosition    int64  `json:"last_position"`
+	PositionUnit    string `json:"position_unit"`
+	BookSize        int64  `json:"book_size"`
+	BookFingerprint string `json:"book_fingerprint"`
 }
 
 type Config struct {
@@ -47,6 +52,7 @@ type App struct {
 	stderr  io.Writer
 	ctx     context.Context
 	pos     atomic.Int64
+	book    BookFileIdentity
 }
 
 func main() {
@@ -102,17 +108,14 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 		}
 	}()
 
-	info, err := os.Stat(cfg.BookFile)
+	bookIdentity, err := inspectBookFile(cfg.BookFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося прочитати файл книги %q: %v\n", cfg.BookFile, err)
 		return 1
 	}
-	if info.IsDir() {
-		fmt.Fprintf(stderr, "Помилка: шлях книги %q є директорією\n", cfg.BookFile)
-		return 1
-	}
+	app.book = bookIdentity
 
-	bookSize := info.Size()
+	bookSize := bookIdentity.Size
 	if bookSize == 0 {
 		fmt.Fprintln(stdout, "--- ПОРОЖНЯ КНИГА ---")
 		fmt.Fprintf(stdout, "Книга: %s\n", cfg.BookFile)
@@ -220,7 +223,7 @@ func parseConfig(args []string, output io.Writer) (Config, error) {
 
 	cfg := Config{}
 	fs.StringVar(&cfg.BookFile, "book", "book.txt", "Шлях до текстового файлу книги")
-	fs.StringVar(&cfg.SaveFile, "save", "book_save.json", "Шлях до файлу прогресу")
+	fs.StringVar(&cfg.SaveFile, "save", "", "Шлях до файлу прогресу")
 	fs.StringVar(&cfg.StartPhrase, "start", "", "Фраза для старту, яка ігнорує збережений прогрес")
 	fs.StringVar(&cfg.Voice, "voice", "", "Точна назва голосу Windows SAPI")
 	fs.IntVar(&cfg.ChunkSize, "chunk", defaultChunkSize, "Розмір фрагмента для озвучення у символах")
@@ -234,6 +237,9 @@ func parseConfig(args []string, output io.Writer) (Config, error) {
 	}
 	if cfg.TTSTimeout <= 0 {
 		return Config{}, fmt.Errorf("значення -tts-timeout має бути більшим за 0")
+	}
+	if strings.TrimSpace(cfg.SaveFile) == "" {
+		cfg.SaveFile = defaultProgressPath(cfg.BookFile)
 	}
 	return cfg, nil
 }
@@ -253,7 +259,7 @@ func (a *App) resolveStartPosition(bookSize int64) (int64, error) {
 		return idx, nil
 	}
 
-	savedPos, hasSave, err := a.loadProgress(bookSize)
+	savedPos, hasSave, err := a.loadProgress(a.book)
 	if err != nil {
 		return 0, err
 	}
@@ -266,7 +272,7 @@ func (a *App) resolveStartPosition(bookSize int64) (int64, error) {
 	return 0, nil
 }
 
-func (a *App) loadProgress(bookSize int64) (int64, bool, error) {
+func (a *App) loadProgress(bookIdentity BookFileIdentity) (int64, bool, error) {
 	file, err := os.ReadFile(a.cfg.SaveFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -279,31 +285,43 @@ func (a *App) loadProgress(bookSize int64) (int64, bool, error) {
 	if err := json.Unmarshal(file, &p); err != nil {
 		return 0, false, fmt.Errorf("файл прогресу має некоректний JSON: %w", err)
 	}
-	if p.Unit != PositionUnit {
-		return 0, false, fmt.Errorf("файл прогресу має несумісну одиницю позиції %q", p.Unit)
+	pos, err := validateProgressForBook(progressBook(a.cfg.BookFile, a.cfg.SaveFile, bookIdentity), p, bookIdentity.Size)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrProgressBookMismatch):
+			return 0, false, fmt.Errorf("файл прогресу належить іншій книзі")
+		case errors.Is(err, ErrPositionOutsideBook):
+			return 0, false, fmt.Errorf("файл прогресу має позицію поза межами книги: %d", p.LastPosition)
+		case errors.Is(err, ErrProgressFormat):
+			return 0, false, fmt.Errorf("файл прогресу має непідтримуваний формат: %w", err)
+		default:
+			return 0, false, fmt.Errorf("файл прогресу несумісний з поточною книгою: %w", err)
+		}
 	}
-	if p.LastPosition < 0 || p.LastPosition > bookSize {
-		return 0, false, fmt.Errorf("файл прогресу має позицію поза межами книги: %d", p.LastPosition)
-	}
-	// Файл збереження може бути змінений вручну, тому позицію перевіряємо до потокового читання.
-	isBoundary, err := isFileUTF8Boundary(a.cfg.BookFile, p.LastPosition, bookSize)
+	isBoundary, err := isFileUTF8Boundary(a.cfg.BookFile, pos, bookIdentity.Size)
 	if err != nil {
 		return 0, false, fmt.Errorf("не вдалося перевірити UTF-8 межу прогресу: %w", err)
 	}
 	if !isBoundary {
-		return 0, false, fmt.Errorf("файл прогресу має позицію всередині UTF-8 символу: %d", p.LastPosition)
+		return 0, false, fmt.Errorf("файл прогресу має позицію всередині UTF-8 символу: %d", pos)
 	}
-	if p.LastPosition == bookSize {
+	if pos == bookIdentity.Size {
 		return 0, false, nil
 	}
-	return p.LastPosition, true, nil
+	return pos, true, nil
 }
 
 func (a *App) saveProgress(pos int64) error {
-	data, err := json.Marshal(Progress{
-		LastPosition: pos,
-		Unit:         PositionUnit,
-	})
+	book := progressBook(a.cfg.BookFile, a.cfg.SaveFile, a.book)
+	if book.File.Fingerprint == "" {
+		identity, err := inspectBookFile(a.cfg.BookFile)
+		if err != nil {
+			return fmt.Errorf("не вдалося отримати ідентичність книги для прогресу: %w", err)
+		}
+		book = progressBook(a.cfg.BookFile, a.cfg.SaveFile, identity)
+	}
+
+	data, err := json.Marshal(progressForBook(book, pos))
 	if err != nil {
 		return fmt.Errorf("не вдалося серіалізувати прогрес: %w", err)
 	}

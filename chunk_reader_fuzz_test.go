@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -94,10 +97,10 @@ func FuzzUTF8Boundary(f *testing.F) {
 }
 
 func FuzzProgressLoad(f *testing.F) {
-	f.Add([]byte("Hello, world!"), mustProgressJSON(f, Progress{LastPosition: 0, Unit: PositionUnit}))
-	f.Add([]byte("Аудіо"), mustProgressJSON(f, Progress{LastPosition: 2, Unit: PositionUnit}))
-	f.Add([]byte("Аудіо"), mustProgressJSON(f, Progress{LastPosition: 1, Unit: PositionUnit}))
-	f.Add([]byte("Hello"), []byte(`{"last_position":-1,"unit":"bytes (UTF-8)"}`))
+	f.Add([]byte("Hello, world!"), mustProgressJSON(f, progressSeedForData([]byte("Hello, world!"), 0)))
+	f.Add([]byte("Аудіо"), mustProgressJSON(f, progressSeedForData([]byte("Аудіо"), 2)))
+	f.Add([]byte("Аудіо"), mustProgressJSON(f, progressSeedForData([]byte("Аудіо"), 1)))
+	f.Add([]byte("Hello"), []byte(`{"version":2,"last_position":-1,"position_unit":"bytes (UTF-8)"}`))
 	f.Add([]byte("Hello"), []byte(`not-json`))
 
 	f.Fuzz(func(t *testing.T, bookData []byte, progressData []byte) {
@@ -120,7 +123,12 @@ func FuzzProgressLoad(f *testing.F) {
 			stdout: io.Discard,
 			stderr: io.Discard,
 		}
-		pos, hasSave, err := app.loadProgress(int64(len(bookData)))
+		identity, err := inspectBookFile(bookPath)
+		if err != nil {
+			t.Fatalf("failed to inspect fuzz book: %v", err)
+		}
+		app.book = identity
+		pos, hasSave, err := app.loadProgress(identity)
 		if err != nil {
 			return
 		}
@@ -229,4 +237,31 @@ func mustProgressJSON(t testing.TB, progress Progress) []byte {
 		t.Fatalf("failed to marshal progress seed: %v", err)
 	}
 	return data
+}
+
+func progressSeedForData(data []byte, pos int64) Progress {
+	identity := bookIdentityForBytes(data)
+	return progressForBook(progressBook("book.txt", "progress.json", identity), pos)
+}
+
+func bookIdentityForBytes(data []byte) BookFileIdentity {
+	hash := sha256.New()
+	fmt.Fprintf(hash, "size:%d\n", len(data))
+
+	const sampleSize = 64 << 10
+	headSize := len(data)
+	if headSize > sampleSize {
+		headSize = sampleSize
+	}
+	if headSize > 0 {
+		_, _ = hash.Write(data[:headSize])
+	}
+	if len(data) > sampleSize {
+		_, _ = hash.Write(data[len(data)-sampleSize:])
+	}
+
+	return BookFileIdentity{
+		Size:        int64(len(data)),
+		Fingerprint: hex.EncodeToString(hash.Sum(nil)),
+	}
 }

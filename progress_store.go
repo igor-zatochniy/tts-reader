@@ -28,27 +28,25 @@ func (JSONProgressStore) Load(book Book, currentSize int64) (int64, error) {
 	if err := json.Unmarshal(data, &progress); err != nil {
 		return 0, fmt.Errorf("invalid progress JSON: %w", err)
 	}
-	if progress.Unit != PositionUnit {
-		return 0, fmt.Errorf("incompatible progress unit %q", progress.Unit)
+	pos, err := validateProgressForBook(book, progress, currentSize)
+	if err != nil {
+		return 0, err
 	}
-	if progress.LastPosition < 0 || progress.LastPosition > currentSize {
-		return 0, ErrPositionOutsideBook
-	}
-	ok, err := isFileUTF8Boundary(book.Path, progress.LastPosition, currentSize)
+	ok, err := isFileUTF8Boundary(book.Path, pos, currentSize)
 	if err != nil {
 		return 0, err
 	}
 	if !ok {
 		return 0, ErrPositionInsideRune
 	}
-	if progress.LastPosition == currentSize {
+	if pos == currentSize {
 		return 0, nil
 	}
-	return progress.LastPosition, nil
+	return pos, nil
 }
 
 func (JSONProgressStore) Save(book Book, pos int64) error {
-	data, err := json.Marshal(Progress{LastPosition: pos, Unit: PositionUnit})
+	data, err := json.Marshal(progressForBook(book, pos))
 	if err != nil {
 		return fmt.Errorf("marshal progress: %w", err)
 	}
@@ -64,4 +62,39 @@ func (s JSONProgressStore) Reset(book Book) error {
 
 func saveBookProgress(book Book, pos int64) error {
 	return JSONProgressStore{}.Save(book, pos)
+}
+
+func progressBook(bookPath, saveFile string, identity BookFileIdentity) Book {
+	return Book{
+		Path:     bookPath,
+		SaveFile: saveFile,
+		Size:     identity.Size,
+		File:     identity,
+	}
+}
+
+func progressForBook(book Book, pos int64) Progress {
+	return Progress{
+		Version:         ProgressVersion,
+		LastPosition:    pos,
+		PositionUnit:    PositionUnit,
+		BookSize:        book.File.Size,
+		BookFingerprint: book.File.Fingerprint,
+	}
+}
+
+func validateProgressForBook(book Book, progress Progress, currentSize int64) (int64, error) {
+	if progress.Version != ProgressVersion {
+		return 0, fmt.Errorf("%w: version %d", ErrProgressFormat, progress.Version)
+	}
+	if progress.PositionUnit != PositionUnit {
+		return 0, fmt.Errorf("%w: position unit %q", ErrProgressFormat, progress.PositionUnit)
+	}
+	if progress.BookSize != currentSize || progress.BookFingerprint != book.File.Fingerprint {
+		return 0, ErrProgressBookMismatch
+	}
+	if progress.LastPosition < 0 || progress.LastPosition > currentSize {
+		return 0, ErrPositionOutsideBook
+	}
+	return progress.LastPosition, nil
 }

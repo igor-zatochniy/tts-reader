@@ -9,6 +9,7 @@ audiobook
 # Локальні дані книги та прогресу
 book.txt
 book_save.json
+*.progress.json
 .*.tmp-*
 
 # Профілі та benchmark-артефакти

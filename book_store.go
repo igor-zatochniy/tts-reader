@@ -110,11 +110,7 @@ func publicBooks(books []Book) []PublicBook {
 }
 
 func defaultProgressPath(bookPath string) string {
-	ext := filepath.Ext(bookPath)
-	if ext == "" {
-		return bookPath + ".progress.json"
-	}
-	return strings.TrimSuffix(bookPath, ext) + ".progress.json"
+	return bookPath + ".progress.json"
 }
 
 func inspectBookFile(path string) (BookFileIdentity, error) {

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunMissingBookReturnsFailure(t *testing.T) {
@@ -74,7 +75,7 @@ func TestRunRejectsNegativeProgress(t *testing.T) {
 	book := filepath.Join(dir, "book.txt")
 	save := filepath.Join(dir, "save.json")
 	mustWriteFile(t, book, "Аудіокнига")
-	mustWriteProgress(t, save, Progress{LastPosition: -1, Unit: PositionUnit})
+	mustWriteProgress(t, save, progressForPath(t, book, save, -1))
 
 	var stdout, stderr bytes.Buffer
 	code := runWithOptions([]string{"-book", book, "-save", save}, &stdout, &stderr, testSpeaker(nil), false)
@@ -92,7 +93,7 @@ func TestRunRejectsProgressInsideUTF8Rune(t *testing.T) {
 	book := filepath.Join(dir, "book.txt")
 	save := filepath.Join(dir, "save.json")
 	mustWriteFile(t, book, "Аудіо")
-	mustWriteProgress(t, save, Progress{LastPosition: 1, Unit: PositionUnit})
+	mustWriteProgress(t, save, progressForPath(t, book, save, 1))
 
 	var stdout, stderr bytes.Buffer
 	code := runWithOptions([]string{"-book", book, "-save", save}, &stdout, &stderr, testSpeaker(nil), false)
@@ -102,6 +103,42 @@ func TestRunRejectsProgressInsideUTF8Rune(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "UTF-8") {
 		t.Fatalf("очікував помилку UTF-8 межі, stderr=%q", stderr.String())
+	}
+}
+
+func TestRunRejectsProgressFromDifferentBook(t *testing.T) {
+	dir := t.TempDir()
+	firstBook := filepath.Join(dir, "first.txt")
+	secondBook := filepath.Join(dir, "second.txt")
+	save := filepath.Join(dir, "shared.progress.json")
+	mustWriteFile(t, firstBook, "abcdef")
+	mustWriteFile(t, secondBook, "uvwxyz")
+	mustWriteProgress(t, save, progressForPath(t, firstBook, save, 3))
+
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", secondBook, "-save", save}, &stdout, &stderr, testSpeaker(nil), false)
+
+	if code != 1 {
+		t.Fatalf("очікував exit code 1, отримав %d", code)
+	}
+	if !strings.Contains(stderr.String(), "іншій книзі") {
+		t.Fatalf("очікував помилку несумісного progress, stderr=%q", stderr.String())
+	}
+}
+
+func TestDefaultProgressPathUsesFullBookFileName(t *testing.T) {
+	dir := t.TempDir()
+	txt := filepath.Join(dir, "novel.txt")
+	md := filepath.Join(dir, "novel.md")
+
+	if defaultProgressPath(txt) != txt+".progress.json" {
+		t.Fatalf("неочікуваний progress path для txt: %q", defaultProgressPath(txt))
+	}
+	if defaultProgressPath(md) != md+".progress.json" {
+		t.Fatalf("неочікуваний progress path для md: %q", defaultProgressPath(md))
+	}
+	if defaultProgressPath(txt) == defaultProgressPath(md) {
+		t.Fatalf("progress paths collide: %q", defaultProgressPath(txt))
 	}
 }
 
@@ -255,6 +292,54 @@ func TestRunRejectsInvalidUTF8Book(t *testing.T) {
 	}
 }
 
+func TestFunctionEngineStopCancelsActiveSpeak(t *testing.T) {
+	started := make(chan struct{}, 1)
+	engine := &functionEngine{
+		speaker: func(ctx context.Context, text string) error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	speakDone := make(chan error, 1)
+	go func() {
+		speakDone <- engine.Speak(context.Background(), "Тест")
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Speak не стартував")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- engine.Stop(context.Background())
+	}()
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("очікував успішний Stop, отримав %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop не завершився")
+	}
+
+	select {
+	case err := <-speakDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("очікував context.Canceled від Speak, отримав %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Speak не завершився після Stop")
+	}
+}
+
 func TestSplitTextSmartKeepsUnicodeText(t *testing.T) {
 	chunks := splitTextSmart("Привіт, світе! Наступне речення.", 16)
 
@@ -332,6 +417,15 @@ func mustWriteProgress(t *testing.T, path string, progress Progress) {
 	}
 }
 
+func progressForPath(t *testing.T, bookPath string, savePath string, pos int64) Progress {
+	t.Helper()
+	identity, err := inspectBookFile(bookPath)
+	if err != nil {
+		t.Fatalf("не вдалося отримати fingerprint книги: %v", err)
+	}
+	return progressForBook(progressBook(bookPath, savePath, identity), pos)
+}
+
 func assertNoProgressTemps(t *testing.T, dir string, target string) {
 	t.Helper()
 	matches, err := filepath.Glob(filepath.Join(dir, "."+filepath.Base(target)+".tmp-*"))
@@ -357,7 +451,13 @@ func assertSavedPosition(t *testing.T, path string, want int64) {
 	if got.LastPosition != want {
 		t.Fatalf("очікував позицію %d, отримав %d", want, got.LastPosition)
 	}
-	if got.Unit != PositionUnit {
-		t.Fatalf("очікував unit %q, отримав %q", PositionUnit, got.Unit)
+	if got.Version != ProgressVersion {
+		t.Fatalf("очікував version %d, отримав %d", ProgressVersion, got.Version)
+	}
+	if got.PositionUnit != PositionUnit {
+		t.Fatalf("очікував position_unit %q, отримав %q", PositionUnit, got.PositionUnit)
+	}
+	if got.BookSize < 0 || got.BookFingerprint == "" {
+		t.Fatalf("progress не прив'язаний до книги: %#v", got)
 	}
 }

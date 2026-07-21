@@ -361,6 +361,79 @@ func TestPlaybackStopWaitsForEngineToStop(t *testing.T) {
 	}
 }
 
+func TestPlaybackStopUsesDurablePositionAfterSavedChunk(t *testing.T) {
+	chunkPersisted := make(chan Chunk, 1)
+	releasePersisted := make(chan struct{})
+	stopCalled := make(chan struct{}, 1)
+	releaseEngineStop := make(chan struct{})
+
+	manager := NewPlaybackManagerWithProgress(
+		func(cfg Config) TTSEngine {
+			return &testEngine{
+				stop: func(ctx context.Context) error {
+					select {
+					case stopCalled <- struct{}{}:
+					default:
+					}
+					<-releaseEngineStop
+					return nil
+				},
+			}
+		},
+		time.Second,
+		NewEventBroker(),
+		JSONProgressStore{},
+	)
+	manager.afterChunkPersisted = func(sessionID uint64, book Book, chunk Chunk) {
+		select {
+		case chunkPersisted <- chunk:
+		default:
+		}
+		<-releasePersisted
+	}
+
+	book := mustAddBook(t, writeTempBook(t, "Перший. Другий."))
+	_, err := manager.Start(book, StartPlaybackRequest{
+		BookID:    book.ID,
+		ChunkSize: intPtr(8),
+	})
+	if err != nil {
+		t.Fatalf("не очікував помилку Start: %v", err)
+	}
+
+	var chunk Chunk
+	select {
+	case chunk = <-chunkPersisted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("playback не дійшов до збереженого chunk")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Stop(context.Background())
+		stopDone <- err
+	}()
+
+	select {
+	case <-stopCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop не викликав engine.Stop")
+	}
+
+	close(releasePersisted)
+	close(releaseEngineStop)
+
+	if err := <-stopDone; err != nil {
+		t.Fatalf("очікував успішний Stop, отримав %v", err)
+	}
+
+	assertSavedPosition(t, book.SaveFile, chunk.EndByte)
+	snapshot := manager.Snapshot()
+	if snapshot.CurrentByte != chunk.EndByte {
+		t.Fatalf("очікував current byte %d, отримав %#v", chunk.EndByte, snapshot)
+	}
+}
+
 func TestConcurrentStartAndSetPosition(t *testing.T) {
 	book := mustAddBook(t, writeTempBook(t, "Перший. Другий."))
 

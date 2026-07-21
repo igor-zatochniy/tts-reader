@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sync"
 )
 
 type Voice struct {
@@ -17,8 +18,11 @@ type TTSEngine interface {
 type engineFactory func(cfg Config) TTSEngine
 
 type functionEngine struct {
+	mu      sync.Mutex
 	speaker speakFunc
 	voices  voiceProvider
+	stop    context.CancelFunc
+	done    chan struct{}
 }
 
 func newFunctionEngineFactory(makeSpeaker speakerFactory, voices voiceProvider) engineFactory {
@@ -31,7 +35,26 @@ func newFunctionEngineFactory(makeSpeaker speakerFactory, voices voiceProvider) 
 }
 
 func (e *functionEngine) Speak(ctx context.Context, text string) error {
-	return e.speaker(ctx, text)
+	speakCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	e.mu.Lock()
+	e.stop = cancel
+	e.done = done
+	e.mu.Unlock()
+
+	defer func() {
+		cancel()
+		e.mu.Lock()
+		if e.done == done {
+			e.stop = nil
+			e.done = nil
+		}
+		e.mu.Unlock()
+		close(done)
+	}()
+
+	return e.speaker(speakCtx, text)
 }
 
 func (e *functionEngine) Voices(ctx context.Context) ([]Voice, error) {
@@ -53,5 +76,28 @@ func (e *functionEngine) Voices(ctx context.Context) ([]Voice, error) {
 }
 
 func (e *functionEngine) Stop(ctx context.Context) error {
-	return nil
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	e.mu.Lock()
+	stop := e.stop
+	done := e.done
+	e.mu.Unlock()
+
+	if stop == nil {
+		return nil
+	}
+
+	stop()
+	if done == nil {
+		return nil
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
