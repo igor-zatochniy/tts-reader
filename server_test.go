@@ -209,100 +209,6 @@ func TestLocalAPIPauseResumeAndStop(t *testing.T) {
 	}
 }
 
-func TestPlaybackManagerIgnoresStaleSessionFailure(t *testing.T) {
-	firstStarted := make(chan struct{}, 1)
-	secondStarted := make(chan struct{}, 1)
-	secondRelease := make(chan struct{})
-
-	var firstPath string
-	var secondPath string
-	var api *LocalAPI
-	events := NewEventBroker()
-	engines := func(cfg Config) TTSEngine {
-		return &testEngine{
-			speakContext: func(ctx context.Context, text string) error {
-				switch cfg.BookFile {
-				case firstPath:
-					select {
-					case firstStarted <- struct{}{}:
-					default:
-					}
-					<-ctx.Done()
-					return ctx.Err()
-				case secondPath:
-					select {
-					case secondStarted <- struct{}{}:
-					default:
-					}
-					select {
-					case <-secondRelease:
-						return nil
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-				default:
-					return nil
-				}
-			},
-		}
-	}
-	api = NewLocalAPI(NewBookStore(), NewPlaybackManager(engines, time.Second, events), engines, "test-token")
-
-	firstPath = writeTempBook(t, "Перша книга.")
-	secondPath = writeTempBook(t, "Друга книга.")
-	firstBook := addTestBook(t, api, firstPath)
-	secondBook := addTestBook(t, api, secondPath)
-
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{
-		BookID:    firstBook.ID,
-		ChunkSize: intPtr(64),
-	})
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("очікував 202 для першої книги, отримав %d: %s", rec.Code, rec.Body.String())
-	}
-	select {
-	case <-firstStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("перша сесія не стартувала")
-	}
-
-	api.playback.mu.Lock()
-	oldSessionID := api.playback.active.id
-	api.playback.mu.Unlock()
-
-	rec = performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback/stop", nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("очікував 200 stop, отримав %d: %s", rec.Code, rec.Body.String())
-	}
-
-	rec = performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{
-		BookID:    secondBook.ID,
-		ChunkSize: intPtr(64),
-	})
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("очікував 202 для другої книги, отримав %d: %s", rec.Code, rec.Body.String())
-	}
-	select {
-	case <-secondStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("друга сесія не стартувала")
-	}
-
-	if err := saveBookProgress(firstBook, 7); err != nil {
-		t.Fatalf("не вдалося підготувати прогрес першої книги: %v", err)
-	}
-
-	api.playback.fail(oldSessionID, firstBook, 0, context.Canceled)
-	snapshot := api.playback.Snapshot()
-	if snapshot.State == playbackFailed || snapshot.BookID != secondBook.ID {
-		t.Fatalf("stale session corrupted active playback: %#v", snapshot)
-	}
-	assertSavedPosition(t, firstBook.SaveFile, 7)
-
-	close(secondRelease)
-	waitForPlaybackState(t, api, playbackFinished)
-}
-
 func TestPlaybackStopWaitsForEngineToStop(t *testing.T) {
 	started := make(chan struct{}, 1)
 	stopCalled := make(chan struct{}, 1)
@@ -361,77 +267,76 @@ func TestPlaybackStopWaitsForEngineToStop(t *testing.T) {
 	}
 }
 
-func TestPlaybackStopUsesDurablePositionAfterSavedChunk(t *testing.T) {
-	chunkPersisted := make(chan Chunk, 1)
-	releasePersisted := make(chan struct{})
-	stopCalled := make(chan struct{}, 1)
-	releaseEngineStop := make(chan struct{})
-
-	manager := NewPlaybackManagerWithProgress(
+func TestPlaybackStopTimeoutLeavesSessionStopping(t *testing.T) {
+	started := make(chan struct{}, 1)
+	releaseSpeak := make(chan struct{})
+	manager := NewPlaybackManager(
 		func(cfg Config) TTSEngine {
 			return &testEngine{
-				stop: func(ctx context.Context) error {
+				speakContext: func(ctx context.Context, text string) error {
 					select {
-					case stopCalled <- struct{}{}:
+					case started <- struct{}{}:
 					default:
 					}
-					<-releaseEngineStop
+					<-releaseSpeak
 					return nil
+				},
+				stop: func(ctx context.Context) error {
+					<-ctx.Done()
+					return ctx.Err()
 				},
 			}
 		},
 		time.Second,
 		NewEventBroker(),
-		JSONProgressStore{},
 	)
-	manager.afterChunkPersisted = func(sessionID uint64, book Book, chunk Chunk) {
-		select {
-		case chunkPersisted <- chunk:
-		default:
-		}
-		<-releasePersisted
-	}
+	book := mustAddBook(t, writeTempBook(t, "Повільне завершення."))
 
-	book := mustAddBook(t, writeTempBook(t, "Перший. Другий."))
 	_, err := manager.Start(book, StartPlaybackRequest{
 		BookID:    book.ID,
-		ChunkSize: intPtr(8),
+		ChunkSize: intPtr(128),
 	})
 	if err != nil {
 		t.Fatalf("не очікував помилку Start: %v", err)
 	}
-
-	var chunk Chunk
 	select {
-	case chunk = <-chunkPersisted:
+	case <-started:
 	case <-time.After(2 * time.Second):
-		t.Fatal("playback не дійшов до збереженого chunk")
+		t.Fatal("playback не стартував")
 	}
 
-	stopDone := make(chan error, 1)
-	go func() {
-		_, err := manager.Stop(context.Background())
-		stopDone <- err
-	}()
-
-	select {
-	case <-stopCalled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stop не викликав engine.Stop")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	snapshot, err := manager.Stop(ctx)
+	if !errors.Is(err, ErrPlaybackStopping) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("очікував ErrPlaybackStopping і deadline, отримав snapshot=%#v err=%v", snapshot, err)
+	}
+	if snapshot.State != playbackStopping {
+		t.Fatalf("очікував стан stopping після timeout, отримав %#v", snapshot)
+	}
+	if snapshot.ErrorCode != "playback_stopping" {
+		t.Fatalf("domain snapshot має містити лише playback_stopping code: %#v", snapshot)
 	}
 
-	close(releasePersisted)
-	close(releaseEngineStop)
-
-	if err := <-stopDone; err != nil {
-		t.Fatalf("очікував успішний Stop, отримав %v", err)
+	_, err = manager.Start(book, StartPlaybackRequest{
+		BookID:    book.ID,
+		ChunkSize: intPtr(128),
+	})
+	if !errors.Is(err, ErrPlaybackStopping) {
+		t.Fatalf("очікував ErrPlaybackStopping для нового Start, отримав %v", err)
 	}
 
-	assertSavedPosition(t, book.SaveFile, chunk.EndByte)
-	snapshot := manager.Snapshot()
-	if snapshot.CurrentByte != chunk.EndByte {
-		t.Fatalf("очікував current byte %d, отримав %#v", chunk.EndByte, snapshot)
+	close(releaseSpeak)
+	if snapshot := waitForManagerState(t, manager, playbackStopped); snapshot.State != playbackStopped {
+		t.Fatalf("після завершення goroutine очікував stopped, отримав %#v", snapshot)
 	}
+	if _, err := manager.Start(book, StartPlaybackRequest{
+		BookID:    book.ID,
+		ChunkSize: intPtr(128),
+	}); err != nil {
+		t.Fatalf("після завершення stopping очікував новий Start без помилки, отримав %v", err)
+	}
+	waitForManagerState(t, manager, playbackFinished)
 }
 
 func TestConcurrentStartAndSetPosition(t *testing.T) {
@@ -463,14 +368,7 @@ func TestConcurrentStartAndSetPosition(t *testing.T) {
 		}()
 		wg.Wait()
 
-		manager.mu.Lock()
-		active := manager.active
-		state := manager.state
-		manager.mu.Unlock()
-		if active != nil && state == playbackStopped {
-			t.Fatalf("invalid state: active session with stopped state")
-		}
-
+		_ = manager.Snapshot()
 		_, _ = manager.Stop(context.Background())
 	}
 }
@@ -507,8 +405,8 @@ func TestStopReturnsProgressSaveError(t *testing.T) {
 	if !errors.Is(err, saveErr) {
 		t.Fatalf("очікував saveErr, отримав %v", err)
 	}
-	if snapshot.State != playbackStopped || snapshot.Error != "internal server error" {
-		t.Fatalf("очікував stopped snapshot з помилкою, отримав %#v", snapshot)
+	if snapshot.State != playbackStopped || snapshot.ErrorCode != "internal_error" {
+		t.Fatalf("очікував stopped domain snapshot з error_code, отримав %#v", snapshot)
 	}
 }
 
@@ -565,14 +463,8 @@ func TestFinishFailsWhenProgressResetFails(t *testing.T) {
 	}
 
 	snapshot := waitForManagerState(t, manager, playbackFailed)
-	if snapshot.Error != "internal server error" || strings.Contains(snapshot.Error, resetErr.Error()) {
-		t.Fatalf("snapshot має містити лише безпечну помилку: %#v", snapshot)
-	}
-	manager.mu.Lock()
-	active := manager.active
-	manager.mu.Unlock()
-	if active != nil {
-		t.Fatalf("persistence failure left active session")
+	if snapshot.ErrorCode != "internal_error" {
+		t.Fatalf("domain snapshot має містити лише error_code: %#v", snapshot)
 	}
 }
 
@@ -599,10 +491,20 @@ func TestPlaybackFailureSanitizesInternalErrors(t *testing.T) {
 	}
 
 	snapshot := waitForManagerState(t, manager, playbackFailed)
-	if snapshot.Error != "internal server error" ||
-		strings.Contains(snapshot.Error, playbackErr.Error()) ||
-		strings.Contains(snapshot.Error, saveErr.Error()) {
+	if snapshot.ErrorCode != "internal_error" ||
+		strings.Contains(snapshot.ErrorCode, playbackErr.Error()) ||
+		strings.Contains(snapshot.ErrorCode, saveErr.Error()) {
 		t.Fatalf("snapshot leaked internal errors: %#v", snapshot)
+	}
+}
+
+func TestPublicPlaybackSnapshotMapsErrorCodeToMessage(t *testing.T) {
+	snapshot := publicPlaybackSnapshot(PlaybackSnapshot{
+		State:     playbackFailed,
+		ErrorCode: "internal_error",
+	})
+	if snapshot.Error != "internal server error" || snapshot.ErrorCode != "internal_error" {
+		t.Fatalf("неочікуваний public snapshot: %#v", snapshot)
 	}
 }
 

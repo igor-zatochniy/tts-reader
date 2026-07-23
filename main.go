@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -17,33 +16,9 @@ import (
 )
 
 const (
-	// Позиція прогресу зберігається в байтах, бо рядки Go індексуються байтовими зміщеннями.
-	PositionUnit      = "bytes (UTF-8)"
-	ProgressVersion   = 2
-	defaultChunkSize  = 250
 	defaultTTSTimeout = 2 * time.Minute
 	previewRuneLimit  = 70
 )
-
-type Progress struct {
-	Version         int    `json:"version"`
-	LastPosition    int64  `json:"last_position"`
-	PositionUnit    string `json:"position_unit"`
-	BookSize        int64  `json:"book_size"`
-	BookFingerprint string `json:"book_fingerprint"`
-}
-
-type Config struct {
-	BookFile    string
-	SaveFile    string
-	StartPhrase string
-	Voice       string
-	ChunkSize   int
-	TTSTimeout  time.Duration
-}
-
-type speakFunc func(ctx context.Context, text string) error
-type speakerFactory func(cfg Config) speakFunc
 
 type App struct {
 	cfg     Config
@@ -232,8 +207,8 @@ func parseConfig(args []string, output io.Writer) (Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
-	if cfg.ChunkSize <= 0 {
-		return Config{}, fmt.Errorf("значення -chunk має бути більшим за 0")
+	if err := validateChunkSize(cfg.ChunkSize); err != nil {
+		return Config{}, fmt.Errorf("значення -chunk має бути між 1 і %d: %w", maxChunkSize, err)
 	}
 	if cfg.TTSTimeout <= 0 {
 		return Config{}, fmt.Errorf("значення -tts-timeout має бути більшим за 0")
@@ -331,51 +306,6 @@ func (a *App) saveProgress(pos int64) error {
 	return nil
 }
 
-// Запис через тимчасовий файл зменшує ризик пошкодити JSON прогресу під час збою процесу.
-func writeFileReplace(path string, data []byte, perm os.FileMode) error {
-	return writeFileReplaceWith(path, data, perm, replaceProgressFile)
-}
-
-func writeFileReplaceWith(path string, data []byte, perm os.FileMode, replace func(string, string) error) error {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
-	if err != nil {
-		return err
-	}
-
-	tmpName := tmp.Name()
-	keepTemp := true
-	defer func() {
-		if keepTemp {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-
-	if err := replace(tmpName, path); err != nil {
-		return err
-	}
-
-	keepTemp = false
-	return nil
-}
-
 func interruptContext() (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	signals := make(chan os.Signal, 2)
@@ -410,13 +340,6 @@ func (a *App) persistInterruptedProgress() int {
 		return 1
 	}
 	return 0
-}
-
-func progressPercent(pos int64, total int64) float64 {
-	if total == 0 {
-		return 100
-	}
-	return (float64(pos) / float64(total)) * 100
 }
 
 // Розбиваємо текст по rune, щоб не різати UTF-8 символи; позиція прогресу рахується у байтах.

@@ -156,11 +156,11 @@ $("setPosition").onclick = async () => {
 };
 
 const source = new EventSource("/api/v1/events" + (apiToken ? "?token=" + encodeURIComponent(apiToken) : ""));
-["playback.started", "chunk.started", "progress.updated", "playback.paused", "playback.resumed", "playback.stopped", "playback.finished", "playback.failed", "position.updated"].forEach((name) => {
+["playback.snapshot", "playback.started", "chunk.started", "progress.updated", "playback.paused", "playback.resumed", "playback.stopping", "playback.stopped", "playback.finished", "playback.failed", "position.updated"].forEach((name) => {
   source.addEventListener(name, (event) => {
     const data = JSON.parse(event.data);
     render(data.playback);
-    log(name + " " + JSON.stringify(data.playback));
+    log("#" + data.seq + " " + name + " " + JSON.stringify(data.playback));
   });
 });
 

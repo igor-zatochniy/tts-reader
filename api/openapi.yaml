@@ -192,10 +192,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PlaybackState"
+        "409":
+          description: Playback is still stopping because the old TTS session did not finish before the request timeout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           $ref: "#/components/responses/Error"
         "500":
-          description: Playback stopped, but engine stop or progress persistence returned an error
+          description: Engine stop or progress persistence returned an internal error
           content:
             application/json:
               schema:
@@ -249,7 +255,7 @@ paths:
               schema:
                 type: string
                 examples:
-                  - "event: progress.updated\ndata: {\"type\":\"progress.updated\"}\n\n"
+                  - "id: 42\nevent: progress.updated\ndata: {\"seq\":42,\"type\":\"progress.updated\"}\n\n"
         "401":
           $ref: "#/components/responses/Error"
         "500":
@@ -372,7 +378,7 @@ components:
       properties:
         state:
           type: string
-          enum: [stopped, playing, paused, finished, failed]
+          enum: [stopped, stopping, playing, paused, finished, failed]
         book_id:
           type: string
           examples: ["book-1"]
@@ -390,22 +396,31 @@ components:
         chunk_size:
           type: integer
           minimum: 1
+        error_code:
+          type: string
+          enum: [internal_error, playback_stopping]
         error:
           type: string
 
     PlaybackEvent:
       type: object
       additionalProperties: false
-      required: [type, time, playback]
+      required: [seq, type, time, playback]
       properties:
+        seq:
+          type: integer
+          format: int64
+          minimum: 1
         type:
           type: string
           enum:
+            - playback.snapshot
             - playback.started
             - chunk.started
             - progress.updated
             - playback.paused
             - playback.resumed
+            - playback.stopping
             - playback.stopped
             - playback.finished
             - playback.failed

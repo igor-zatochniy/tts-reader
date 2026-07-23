@@ -22,26 +22,34 @@ type LocalAPI struct {
 	token    string
 }
 
-type AddBookRequest struct {
-	Path  string `json:"path"`
-	Title string `json:"title"`
-}
-
-type StartPlaybackRequest struct {
-	BookID    string `json:"book_id"`
-	Voice     string `json:"voice,omitempty"`
-	ChunkSize *int   `json:"chunk_size,omitempty"`
-}
-
-type SetPositionRequest struct {
-	BookID      string `json:"book_id"`
-	CurrentByte *int64 `json:"current_byte"`
-}
-
 type ErrorResponse struct {
-	Code     string            `json:"code"`
-	Error    string            `json:"error"`
-	Playback *PlaybackSnapshot `json:"playback,omitempty"`
+	Code     string                  `json:"code"`
+	Error    string                  `json:"error"`
+	Playback *PublicPlaybackSnapshot `json:"playback,omitempty"`
+}
+
+type PublicPlaybackSnapshot struct {
+	State           string  `json:"state"`
+	BookID          string  `json:"book_id,omitempty"`
+	ProgressPercent float64 `json:"progress_percent"`
+	CurrentByte     int64   `json:"current_byte"`
+	Voice           string  `json:"voice,omitempty"`
+	ChunkSize       int     `json:"chunk_size,omitempty"`
+	ErrorCode       string  `json:"error_code,omitempty"`
+	Error           string  `json:"error,omitempty"`
+}
+
+type PublicPlaybackEvent struct {
+	Seq      uint64                 `json:"seq"`
+	Type     string                 `json:"type"`
+	Time     time.Time              `json:"time"`
+	Playback PublicPlaybackSnapshot `json:"playback"`
+}
+
+type PublicBook struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Size  int64  `json:"size"`
 }
 
 func isAllowedOrigin(r *http.Request) bool {
@@ -191,11 +199,11 @@ func (api *LocalAPI) handleStartPlayback(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, snapshot)
+	writePlaybackSnapshot(w, http.StatusAccepted, snapshot)
 }
 
 func (api *LocalAPI) handlePlaybackState(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, api.playback.Snapshot())
+	writePlaybackSnapshot(w, http.StatusOK, api.playback.Snapshot())
 }
 
 func (api *LocalAPI) handlePausePlayback(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +212,7 @@ func (api *LocalAPI) handlePausePlayback(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, snapshot)
+	writePlaybackSnapshot(w, http.StatusOK, snapshot)
 }
 
 func (api *LocalAPI) handleResumePlayback(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +221,7 @@ func (api *LocalAPI) handleResumePlayback(w http.ResponseWriter, r *http.Request
 		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, snapshot)
+	writePlaybackSnapshot(w, http.StatusOK, snapshot)
 }
 
 func (api *LocalAPI) handleStopPlayback(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +233,7 @@ func (api *LocalAPI) handleStopPlayback(w http.ResponseWriter, r *http.Request) 
 		writePlaybackError(w, err, snapshot)
 		return
 	}
-	writeJSON(w, http.StatusOK, snapshot)
+	writePlaybackSnapshot(w, http.StatusOK, snapshot)
 }
 
 func (api *LocalAPI) handleSetPosition(w http.ResponseWriter, r *http.Request) {
@@ -249,7 +257,7 @@ func (api *LocalAPI) handleSetPosition(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, snapshot)
+	writePlaybackSnapshot(w, http.StatusOK, snapshot)
 }
 
 func (api *LocalAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -259,14 +267,24 @@ func (api *LocalAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, unsubscribe := api.playback.events.Subscribe()
+	events, unsubscribe := api.playback.Events().Subscribe()
 	defer unsubscribe()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
+
+	if _, err := fmt.Fprint(w, "retry: 1000\n"); err != nil {
+		return
+	}
+	if err := writeSSEPlaybackEvent(w, api.playback.Events().NewEvent("playback.snapshot", api.playback.Snapshot())); err != nil {
+		return
+	}
 	flusher.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
 
 	for {
 		select {
@@ -274,12 +292,14 @@ func (api *LocalAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			data, err := json.Marshal(event)
-			if err != nil {
-				continue
+			if err := writeSSEPlaybackEvent(w, event); err != nil {
+				return
 			}
-			fmt.Fprintf(w, "event: %s\n", event.Type)
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -311,6 +331,10 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+func writePlaybackSnapshot(w http.ResponseWriter, status int, snapshot PlaybackSnapshot) {
+	writeJSON(w, status, publicPlaybackSnapshot(snapshot))
+}
+
 func writeError(w http.ResponseWriter, status int, code string, message string) {
 	writeJSON(w, status, ErrorResponse{Code: code, Error: message})
 }
@@ -325,17 +349,84 @@ func writeAPIError(w http.ResponseWriter, err error) {
 
 func writePlaybackError(w http.ResponseWriter, err error, snapshot PlaybackSnapshot) {
 	logInternalError("http api", err)
+	publicSnapshot := publicPlaybackSnapshot(snapshot)
 	writeJSON(w, statusForError(err), ErrorResponse{
 		Code:     codeForError(err),
 		Error:    publicErrorMessageForError(err),
-		Playback: &snapshot,
+		Playback: &publicSnapshot,
 	})
+}
+
+func publicPlaybackEvent(event PlaybackEvent) PublicPlaybackEvent {
+	return PublicPlaybackEvent{
+		Seq:      event.Seq,
+		Type:     event.Type,
+		Time:     event.Time,
+		Playback: publicPlaybackSnapshot(event.Playback),
+	}
+}
+
+func writeSSEPlaybackEvent(w io.Writer, event PlaybackEvent) error {
+	data, err := json.Marshal(publicPlaybackEvent(event))
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "id: %d\n", event.Seq); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\n", event.Type); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	return err
+}
+
+func publicPlaybackSnapshot(snapshot PlaybackSnapshot) PublicPlaybackSnapshot {
+	public := PublicPlaybackSnapshot{
+		State:           snapshot.State,
+		BookID:          snapshot.BookID,
+		ProgressPercent: snapshot.ProgressPercent,
+		CurrentByte:     snapshot.CurrentByte,
+		Voice:           snapshot.Voice,
+		ChunkSize:       snapshot.ChunkSize,
+		ErrorCode:       snapshot.ErrorCode,
+	}
+	if public.ErrorCode == "" {
+		return public
+	}
+	public.Error = publicErrorMessageForCode(public.ErrorCode)
+	return public
+}
+
+func publicBook(book Book) PublicBook {
+	return PublicBook{ID: book.ID, Title: book.Title, Size: book.Size}
+}
+
+func publicBooks(books []Book) []PublicBook {
+	result := make([]PublicBook, 0, len(books))
+	for _, book := range books {
+		result = append(result, publicBook(book))
+	}
+	return result
+}
+
+func publicErrorMessageForCode(code string) string {
+	switch code {
+	case "playback_stopping":
+		return "playback is still stopping"
+	case "internal_error":
+		return "internal server error"
+	default:
+		return ""
+	}
 }
 
 func publicErrorMessageForError(err error) string {
 	switch {
 	case errors.Is(err, ErrPlaybackActive):
 		return "playback is already active"
+	case errors.Is(err, ErrPlaybackStopping):
+		return "playback is still stopping"
 	case errors.Is(err, ErrPlaybackNotPlaying):
 		return "playback is not playing"
 	case errors.Is(err, ErrPlaybackNotPaused):
@@ -383,6 +474,7 @@ func logInternalError(scope string, err error) {
 func statusForError(err error) int {
 	switch {
 	case errors.Is(err, ErrPlaybackActive),
+		errors.Is(err, ErrPlaybackStopping),
 		errors.Is(err, ErrBookModified),
 		errors.Is(err, ErrProgressBookMismatch),
 		errors.Is(err, ErrProgressFormat),
@@ -412,6 +504,8 @@ func codeForError(err error) string {
 	switch {
 	case errors.Is(err, ErrPlaybackActive):
 		return "playback_active"
+	case errors.Is(err, ErrPlaybackStopping):
+		return "playback_stopping"
 	case errors.Is(err, ErrPlaybackNotPlaying):
 		return "playback_not_playing"
 	case errors.Is(err, ErrPlaybackNotPaused):

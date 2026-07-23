@@ -34,8 +34,21 @@ func TestRunRejectsInvalidChunk(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("очікував exit code 2, отримав %d", code)
 	}
-	if !strings.Contains(stderr.String(), "більшим за 0") {
+	if !strings.Contains(stderr.String(), "-chunk") || !strings.Contains(stderr.String(), "10000") {
 		t.Fatalf("очікував помилку валідації chunk, stderr=%q", stderr.String())
+	}
+}
+
+func TestRunRejectsChunkAboveMaximum(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := runWithOptions([]string{"-chunk", "10001"}, &stdout, &stderr, testSpeaker(nil), false)
+
+	if code != 2 {
+		t.Fatalf("очікував exit code 2, отримав %d", code)
+	}
+	if !strings.Contains(stderr.String(), "-chunk") || !strings.Contains(stderr.String(), "10000") {
+		t.Fatalf("очікував помилку валідації максимального chunk, stderr=%q", stderr.String())
 	}
 }
 
@@ -294,16 +307,19 @@ func TestRunRejectsInvalidUTF8Book(t *testing.T) {
 
 func TestFunctionEngineStopCancelsActiveSpeak(t *testing.T) {
 	started := make(chan struct{}, 1)
-	engine := &functionEngine{
-		speaker: func(ctx context.Context, text string) error {
-			select {
-			case started <- struct{}{}:
-			default:
+	engine := newFunctionEngineFactory(
+		func(cfg Config) speakFunc {
+			return func(ctx context.Context, text string) error {
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+				<-ctx.Done()
+				return ctx.Err()
 			}
-			<-ctx.Done()
-			return ctx.Err()
 		},
-	}
+		func() ([]string, error) { return nil, nil },
+	)(Config{})
 
 	speakDone := make(chan error, 1)
 	go func() {

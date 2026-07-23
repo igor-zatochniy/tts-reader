@@ -24,37 +24,12 @@ var openAPISpec string
 const (
 	defaultServeAddr = "127.0.0.1:8080"
 	maxJSONBodySize  = 1 << 20
-
-	playbackStopped  = "stopped"
-	playbackPlaying  = "playing"
-	playbackPaused   = "paused"
-	playbackFinished = "finished"
-	playbackFailed   = "failed"
-
-	maxChunkSize = 10000
 )
 
 var (
-	ErrPlaybackActive       = errors.New("playback active")
-	ErrPlaybackNotPlaying   = errors.New("playback not playing")
-	ErrPlaybackNotPaused    = errors.New("playback not paused")
-	ErrBookModified         = errors.New("book modified")
-	ErrBookNotFound         = errors.New("book not found")
-	ErrBookNotReadable      = errors.New("book not readable")
-	ErrBookNotRegular       = errors.New("book must be a regular file")
-	ErrPathRequired         = errors.New("path required")
-	ErrBookIDRequired       = errors.New("book_id required")
-	ErrCurrentByteRequired  = errors.New("current_byte required")
-	ErrPositionOutsideBook  = errors.New("position outside book")
-	ErrPositionInsideRune   = errors.New("position inside UTF-8 rune")
-	ErrInvalidChunkSize     = errors.New("invalid chunk_size")
-	ErrUnsupportedMedia     = errors.New("unsupported media type")
-	ErrInvalidJSON          = errors.New("invalid JSON request")
-	ErrProgressFormat       = errors.New("unsupported progress format")
-	ErrProgressBookMismatch = errors.New("progress belongs to a different book")
+	ErrUnsupportedMedia = errors.New("unsupported media type")
+	ErrInvalidJSON      = errors.New("invalid JSON request")
 )
-
-type voiceProvider func() ([]string, error)
 
 type ServeConfig struct {
 	Addr       string

@@ -211,16 +211,20 @@ Voices response:
 SSE event types:
 
 ```text
+playback.snapshot
 playback.started
 chunk.started
 progress.updated
 playback.paused
 playback.resumed
+playback.stopping
 playback.stopped
 playback.finished
 playback.failed
 position.updated
 ```
+
+Кожна SSE-подія має monotonic `seq` і SSE `id`. `chunk.started` та `progress.updated` є best-effort подіями: якщо клієнт не встигає читати потік, такі проміжні оновлення можуть бути пропущені. Lifecycle-події (`playback.failed`, `playback.finished`, `playback.stopped` тощо) не відкидаються мовчки: переповнений клієнт відключається, EventSource перепідключається і одразу отримує актуальний `playback.snapshot`. SSE stream також надсилає heartbeat comments.
 
 ## Прапорці CLI
 

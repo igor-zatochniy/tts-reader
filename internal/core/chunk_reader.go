@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"bufio"
@@ -36,8 +36,8 @@ type StreamingChunkReader struct {
 }
 
 func NewStreamingChunkReader(reader io.Reader, startByte int64, limit int) (*StreamingChunkReader, error) {
-	if limit <= 0 {
-		return nil, fmt.Errorf("розмір фрагмента має бути більшим за 0")
+	if err := validateChunkSize(limit); err != nil {
+		return nil, err
 	}
 	return &StreamingChunkReader{
 		reader:   bufio.NewReader(reader),

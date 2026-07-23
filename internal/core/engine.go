@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"context"
@@ -14,8 +14,6 @@ type TTSEngine interface {
 	Voices(ctx context.Context) ([]Voice, error)
 	Stop(ctx context.Context) error
 }
-
-type engineFactory func(cfg Config) TTSEngine
 
 type functionEngine struct {
 	mu      sync.Mutex
