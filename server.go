@@ -16,6 +16,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/igor-zatochniy/tts-reader/internal/book"
+	"github.com/igor-zatochniy/tts-reader/internal/playback"
+	"github.com/igor-zatochniy/tts-reader/internal/tts"
 )
 
 //go:embed api/openapi.yaml
@@ -59,7 +63,7 @@ func parseServeConfig(args []string, output io.Writer) (ServeConfig, error) {
 	return cfg, nil
 }
 
-func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactory, voices voiceProvider, enableSignals bool) int {
+func runServe(args []string, stdout, stderr io.Writer, makeSpeaker tts.SpeakerFactory, voices tts.VoiceProvider, enableSignals bool) int {
 	cfg, err := parseServeConfig(args, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -69,14 +73,14 @@ func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactor
 		return 2
 	}
 
-	events := NewEventBroker()
-	engines := newFunctionEngineFactory(makeSpeaker, voices)
+	events := playback.NewEventBroker()
+	engines := tts.NewFunctionEngineFactory(makeSpeaker, voices)
 	token, err := generateAPIToken()
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося створити API token: %v\n", err)
 		return 1
 	}
-	api := NewLocalAPI(NewBookStore(), NewPlaybackManager(engines, cfg.TTSTimeout, events), engines, token)
+	api := NewLocalAPI(book.NewStore(), playback.NewManager(engines, cfg.TTSTimeout, events), engines, token)
 	serveCtx, cancelServe := context.WithCancel(context.Background())
 	defer cancelServe()
 	server := newLocalHTTPServer(cfg.Addr, api.Routes(), serveCtx)
@@ -96,15 +100,16 @@ func runServe(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactor
 
 	select {
 	case <-ctx.Done():
+		api.BeginShutdown()
 		cancelServe()
-
-		playbackCtx, cancelPlayback := context.WithTimeout(context.Background(), 10*time.Second)
-		_, playbackErr := api.playback.Stop(playbackCtx)
-		cancelPlayback()
 
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		shutdownErr := server.Shutdown(shutdownCtx)
 		cancelShutdown()
+
+		playbackCtx, cancelPlayback := context.WithTimeout(context.Background(), 10*time.Second)
+		_, playbackErr := api.playback.Stop(playbackCtx)
+		cancelPlayback()
 
 		if err := errors.Join(playbackErr, shutdownErr); err != nil {
 			fmt.Fprintf(stderr, "Помилка: не вдалося коректно зупинити HTTP API: %v\n", err)

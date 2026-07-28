@@ -1,15 +1,15 @@
-package core
+package progress
 
 import (
 	"os"
 	"path/filepath"
 )
 
-func writeFileReplace(path string, data []byte, perm os.FileMode) error {
-	return writeFileReplaceWith(path, data, perm, replaceProgressFile)
+func WriteFileReplace(path string, data []byte, perm os.FileMode) error {
+	return WriteFileReplaceWith(path, data, perm, replaceProgressFile)
 }
 
-func writeFileReplaceWith(path string, data []byte, perm os.FileMode, replace func(string, string) error) error {
+func WriteFileReplaceWith(path string, data []byte, perm os.FileMode, replace func(string, string) error) error {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
 	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
@@ -49,13 +49,9 @@ func writeFileReplaceWith(path string, data []byte, perm os.FileMode, replace fu
 	return nil
 }
 
-func progressPercent(pos int64, total int64) float64 {
+func Percent(pos int64, total int64) float64 {
 	if total == 0 {
 		return 100
 	}
 	return (float64(pos) / float64(total)) * 100
-}
-
-func ProgressPercent(pos int64, total int64) float64 {
-	return progressPercent(pos, total)
 }

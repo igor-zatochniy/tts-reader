@@ -1,8 +1,9 @@
-package core
+package book
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,26 +13,33 @@ import (
 	"time"
 )
 
+var (
+	ErrModified     = errors.New("book modified")
+	ErrNotFound     = errors.New("book not found")
+	ErrNotReadable  = errors.New("book not readable")
+	ErrNotRegular   = errors.New("book must be a regular file")
+	ErrPathRequired = errors.New("path required")
+)
+
 type Book struct {
-	ID        string           `json:"-"`
-	Title     string           `json:"-"`
-	Path      string           `json:"-"`
-	SaveFile  string           `json:"-"`
-	Size      int64            `json:"-"`
-	File      BookFileIdentity `json:"-"`
-	CreatedAt time.Time        `json:"-"`
+	ID        string       `json:"-"`
+	Title     string       `json:"-"`
+	Path      string       `json:"-"`
+	SaveFile  string       `json:"-"`
+	Size      int64        `json:"-"`
+	File      FileIdentity `json:"-"`
+	CreatedAt time.Time    `json:"-"`
 }
 
-type BookFileIdentity struct {
+type FileIdentity struct {
 	Size        int64
 	ModifiedAt  time.Time
 	Fingerprint string
 }
 
-type PublicBook struct {
-	ID    string `json:"id"`
+type AddRequest struct {
+	Path  string `json:"path"`
 	Title string `json:"title"`
-	Size  int64  `json:"size"`
 }
 
 type BookStore struct {
@@ -40,20 +48,20 @@ type BookStore struct {
 	books map[string]Book
 }
 
-func NewBookStore() *BookStore {
+func NewStore() *BookStore {
 	return &BookStore{books: make(map[string]Book)}
 }
 
-func (s *BookStore) Add(req AddBookRequest) (Book, error) {
+func (s *BookStore) Add(req AddRequest) (Book, error) {
 	if strings.TrimSpace(req.Path) == "" {
 		return Book{}, ErrPathRequired
 	}
 
 	absPath, err := filepath.Abs(req.Path)
 	if err != nil {
-		return Book{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+		return Book{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
-	identity, err := inspectBookFile(absPath)
+	identity, err := InspectFile(absPath)
 	if err != nil {
 		return Book{}, err
 	}
@@ -70,7 +78,7 @@ func (s *BookStore) Add(req AddBookRequest) (Book, error) {
 		ID:        fmt.Sprintf("book-%d", s.next),
 		Title:     title,
 		Path:      absPath,
-		SaveFile:  defaultProgressPath(absPath),
+		SaveFile:  DefaultProgressPath(absPath),
 		Size:      identity.Size,
 		File:      identity,
 		CreatedAt: time.Now().UTC(),
@@ -97,35 +105,23 @@ func (s *BookStore) Get(id string) (Book, bool) {
 	return book, ok
 }
 
-func publicBook(book Book) PublicBook {
-	return PublicBook{ID: book.ID, Title: book.Title, Size: book.Size}
-}
-
-func publicBooks(books []Book) []PublicBook {
-	result := make([]PublicBook, 0, len(books))
-	for _, book := range books {
-		result = append(result, publicBook(book))
-	}
-	return result
-}
-
-func defaultProgressPath(bookPath string) string {
+func DefaultProgressPath(bookPath string) string {
 	return bookPath + ".progress.json"
 }
 
-func inspectBookFile(path string) (BookFileIdentity, error) {
+func InspectFile(path string) (FileIdentity, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
 	if !info.Mode().IsRegular() {
-		return BookFileIdentity{}, ErrBookNotRegular
+		return FileIdentity{}, ErrNotRegular
 	}
 
 	hash := sha256.New()
@@ -135,26 +131,26 @@ func inspectBookFile(path string) (BookFileIdentity, error) {
 	headSize := minInt64(info.Size(), sampleSize)
 	if headSize > 0 {
 		if _, err := io.CopyN(hash, file, headSize); err != nil {
-			return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+			return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 		}
 	}
 	if info.Size() > sampleSize {
 		if _, err := file.Seek(info.Size()-sampleSize, io.SeekStart); err != nil {
-			return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+			return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 		}
 		if _, err := io.CopyN(hash, file, sampleSize); err != nil {
-			return BookFileIdentity{}, fmt.Errorf("%w: %v", ErrBookNotReadable, err)
+			return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 		}
 	}
 
-	return BookFileIdentity{
+	return FileIdentity{
 		Size:        info.Size(),
 		ModifiedAt:  info.ModTime().UTC(),
 		Fingerprint: hex.EncodeToString(hash.Sum(nil)),
 	}, nil
 }
 
-func sameBookFile(registered BookFileIdentity, current BookFileIdentity) bool {
+func SameFile(registered FileIdentity, current FileIdentity) bool {
 	return registered.Size == current.Size &&
 		registered.ModifiedAt.Equal(current.ModifiedAt) &&
 		registered.Fingerprint == current.Fingerprint

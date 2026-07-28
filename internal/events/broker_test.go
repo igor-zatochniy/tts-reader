@@ -1,4 +1,4 @@
-package core
+package events
 
 import (
 	"testing"
@@ -6,11 +6,11 @@ import (
 )
 
 func TestEventBrokerAssignsSequenceNumbers(t *testing.T) {
-	broker := NewEventBroker()
+	broker := newTestBroker()
 	events, unsubscribe := broker.Subscribe()
 	defer unsubscribe()
 
-	broker.Publish(PlaybackEvent{Type: "playback.started"})
+	broker.Publish(testEvent{Type: "playback.started"})
 	first := receiveEvent(t, events)
 	if first.Seq != 1 {
 		t.Fatalf("очікував seq=1, отримав %#v", first)
@@ -19,19 +19,19 @@ func TestEventBrokerAssignsSequenceNumbers(t *testing.T) {
 		t.Fatalf("очікував заповнений timestamp, отримав %#v", first)
 	}
 
-	second := broker.NewEvent("playback.snapshot", PlaybackSnapshot{State: playbackPlaying})
+	second := broker.NewEvent(testEvent{Type: "playback.snapshot"})
 	if second.Seq != 2 || second.Type != "playback.snapshot" {
 		t.Fatalf("неочікуваний snapshot event: %#v", second)
 	}
 }
 
 func TestEventBrokerDropsLossyProgressForSlowClient(t *testing.T) {
-	broker := NewEventBroker()
+	broker := newTestBroker()
 	events, unsubscribe := broker.Subscribe()
 	defer unsubscribe()
 
 	for i := 0; i < eventBufferSize+5; i++ {
-		broker.Publish(PlaybackEvent{Type: "progress.updated"})
+		broker.Publish(testEvent{Type: "progress.updated"})
 	}
 
 	for i := 0; i < eventBufferSize; i++ {
@@ -49,14 +49,14 @@ func TestEventBrokerDropsLossyProgressForSlowClient(t *testing.T) {
 }
 
 func TestEventBrokerDisconnectsSlowClientOnReliableEvent(t *testing.T) {
-	broker := NewEventBroker()
+	broker := newTestBroker()
 	events, unsubscribe := broker.Subscribe()
 	defer unsubscribe()
 
 	for i := 0; i < eventBufferSize; i++ {
-		broker.Publish(PlaybackEvent{Type: "progress.updated"})
+		broker.Publish(testEvent{Type: "progress.updated"})
 	}
-	broker.Publish(PlaybackEvent{Type: "playback.finished"})
+	broker.Publish(testEvent{Type: "playback.finished"})
 
 	for i := 0; i < eventBufferSize; i++ {
 		event := receiveEvent(t, events)
@@ -76,18 +76,40 @@ func TestEventBrokerDisconnectsSlowClientOnReliableEvent(t *testing.T) {
 }
 
 func TestEventBrokerDeliversReliableEventWhenClientHasCapacity(t *testing.T) {
-	broker := NewEventBroker()
+	broker := newTestBroker()
 	events, unsubscribe := broker.Subscribe()
 	defer unsubscribe()
 
-	broker.Publish(PlaybackEvent{Type: "playback.failed"})
+	broker.Publish(testEvent{Type: "playback.failed"})
 	event := receiveEvent(t, events)
 	if event.Type != "playback.failed" {
 		t.Fatalf("очікував playback.failed, отримав %#v", event)
 	}
 }
 
-func receiveEvent(t *testing.T, events <-chan PlaybackEvent) PlaybackEvent {
+type testEvent struct {
+	Seq  uint64
+	Type string
+	Time time.Time
+}
+
+func newTestBroker() *Broker[testEvent] {
+	return NewBroker(Options[testEvent]{
+		IsLossy: func(event testEvent) bool {
+			return event.Type == "progress.updated"
+		},
+		Sequence: func(event testEvent) uint64 {
+			return event.Seq
+		},
+		WithMetadata: func(event testEvent, seq uint64, at time.Time) testEvent {
+			event.Seq = seq
+			event.Time = at
+			return event
+		},
+	})
+}
+
+func receiveEvent(t *testing.T, events <-chan testEvent) testEvent {
 	t.Helper()
 	select {
 	case event, ok := <-events:
@@ -97,6 +119,6 @@ func receiveEvent(t *testing.T, events <-chan PlaybackEvent) PlaybackEvent {
 		return event
 	case <-time.After(time.Second):
 		t.Fatal("подія не надійшла")
-		return PlaybackEvent{}
+		return testEvent{}
 	}
 }

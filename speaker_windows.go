@@ -11,9 +11,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/igor-zatochniy/tts-reader/internal/tts"
 )
 
-func newSpeaker(cfg Config) speakFunc {
+func newSpeaker(cfg tts.Config) tts.SpeakFunc {
 	return func(ctx context.Context, text string) error {
 		return speakWindows(ctx, text, cfg.Voice, cfg.TTSTimeout)
 	}

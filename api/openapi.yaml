@@ -1,4 +1,4 @@
-openapi: 3.1.0
+openapi: 3.0.3
 info:
   title: Audiobook TTS Reader Local API
   version: 1.0.0
@@ -76,6 +76,8 @@ paths:
           $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     get:
       tags: [Books]
       operationId: listBooks
@@ -122,6 +124,8 @@ paths:
           $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     get:
       tags: [Playback]
       operationId: getPlaybackState
@@ -156,6 +160,8 @@ paths:
           $ref: "#/components/responses/Error"
         "401":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/playback/resume:
     post:
@@ -176,6 +182,8 @@ paths:
           $ref: "#/components/responses/Error"
         "401":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/playback/stop:
     post:
@@ -206,6 +214,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/playback/position:
     put:
@@ -238,6 +248,8 @@ paths:
           $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/events:
     get:
@@ -254,8 +266,7 @@ paths:
             text/event-stream:
               schema:
                 type: string
-                examples:
-                  - "id: 42\nevent: progress.updated\ndata: {\"seq\":42,\"type\":\"progress.updated\"}\n\n"
+                example: "id: 42\nevent: progress.updated\ndata: {\"seq\":42,\"type\":\"progress.updated\"}\n\n"
         "401":
           $ref: "#/components/responses/Error"
         "500":
@@ -281,6 +292,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    ServiceUnavailable:
+      description: The local service is shutting down and no longer accepts state-changing requests
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
 
   schemas:
     Voice:
@@ -290,7 +307,7 @@ components:
       properties:
         name:
           type: string
-          examples: ["Microsoft Irina Desktop"]
+          example: "Microsoft Irina Desktop"
 
     VoicesResponse:
       type: object
@@ -310,10 +327,10 @@ components:
         path:
           type: string
           description: Absolute or relative local path to a UTF-8 text file.
-          examples: ["C:\\Books\\novel.txt"]
+          example: "C:\\Books\\novel.txt"
         title:
           type: string
-          examples: ["Novel"]
+          example: "Novel"
 
     Book:
       type: object
@@ -323,7 +340,8 @@ components:
       properties:
         id:
           type: string
-          examples: ["book-1"]
+          example: "book-1"
+          x-go-name: ID
         title:
           type: string
         size:
@@ -348,15 +366,17 @@ components:
       properties:
         book_id:
           type: string
-          examples: ["book-1"]
+          example: "book-1"
+          x-go-name: BookID
         voice:
           type: string
-          examples: ["Microsoft Irina Desktop"]
+          example: "Microsoft Irina Desktop"
         chunk_size:
           type: integer
           minimum: 1
           maximum: 10000
           default: 250
+          x-go-type-skip-optional-pointer: false
 
     SetPositionRequest:
       type: object
@@ -365,11 +385,13 @@ components:
       properties:
         book_id:
           type: string
-          examples: ["book-1"]
+          example: "book-1"
+          x-go-name: BookID
         current_byte:
           type: integer
           format: int64
           minimum: 0
+          x-go-type: "*int64"
 
     PlaybackState:
       type: object
@@ -381,7 +403,8 @@ components:
           enum: [stopped, stopping, playing, paused, finished, failed]
         book_id:
           type: string
-          examples: ["book-1"]
+          example: "book-1"
+          x-go-name: BookID
         progress_percent:
           type: number
           format: double
@@ -430,6 +453,7 @@ components:
           format: date-time
         playback:
           $ref: "#/components/schemas/PlaybackState"
+          x-go-type-skip-optional-pointer: false
 
     ErrorResponse:
       type: object
@@ -438,7 +462,7 @@ components:
       properties:
         code:
           type: string
-          examples: ["book_modified"]
+          example: "book_modified"
         error:
           type: string
         playback:

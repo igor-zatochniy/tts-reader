@@ -57,6 +57,18 @@ jobs:
       - name: Validate OpenAPI
         run: npx --yes @redocly/cli@2.38.0 lint api/openapi.yaml
 
+      - name: Generate OpenAPI models
+        run: go generate ./internal/httpapi
+
+      - name: Verify generated OpenAPI models
+        shell: pwsh
+        run: |
+          $changes = git status --porcelain -- internal/httpapi/types.gen.go
+          if ($changes) {
+            $changes
+            throw "Generated OpenAPI models are out of date. Run: go generate ./internal/httpapi"
+          }
+
       - name: Verify modules
         run: go mod verify
 

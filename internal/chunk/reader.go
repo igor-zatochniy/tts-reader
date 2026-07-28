@@ -1,13 +1,21 @@
-package core
+package chunk
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"unicode/utf8"
 )
+
+const (
+	DefaultSize = 250
+	MaxSize     = 10000
+)
+
+var ErrInvalidSize = errors.New("invalid chunk_size")
 
 type Chunk struct {
 	Text      string
@@ -25,7 +33,7 @@ type chunkRune struct {
 	startByte int64
 }
 
-type StreamingChunkReader struct {
+type StreamingReader struct {
 	reader   *bufio.Reader
 	limit    int
 	nextByte int64
@@ -35,11 +43,11 @@ type StreamingChunkReader struct {
 	eof      bool
 }
 
-func NewStreamingChunkReader(reader io.Reader, startByte int64, limit int) (*StreamingChunkReader, error) {
-	if err := validateChunkSize(limit); err != nil {
+func NewStreamingReader(reader io.Reader, startByte int64, limit int) (*StreamingReader, error) {
+	if err := ValidateSize(limit); err != nil {
 		return nil, err
 	}
-	return &StreamingChunkReader{
+	return &StreamingReader{
 		reader:   bufio.NewReader(reader),
 		limit:    limit,
 		nextByte: startByte,
@@ -47,7 +55,14 @@ func NewStreamingChunkReader(reader io.Reader, startByte int64, limit int) (*Str
 	}, nil
 }
 
-func (r *StreamingChunkReader) Next() (Chunk, error) {
+func ValidateSize(size int) error {
+	if size < 1 || size > MaxSize {
+		return fmt.Errorf("%w: chunk_size must be between 1 and %d", ErrInvalidSize, MaxSize)
+	}
+	return nil
+}
+
+func (r *StreamingReader) Next() (Chunk, error) {
 	items := r.buffer[:0]
 	for len(items) < r.limit {
 		if r.pendingI < len(r.pending) {
@@ -146,7 +161,7 @@ func chunkRunesToString(items []chunkRune) string {
 	return builder.String()
 }
 
-func findPhraseOffset(path string, phrase string) (int64, bool, error) {
+func FindPhraseOffset(path string, phrase string) (int64, bool, error) {
 	if phrase == "" {
 		return 0, true, nil
 	}
@@ -200,7 +215,7 @@ func equalRunes(left []rune, right []rune) bool {
 	return true
 }
 
-func isFileUTF8Boundary(path string, pos int64, size int64) (bool, error) {
+func IsFileUTF8Boundary(path string, pos int64, size int64) (bool, error) {
 	if pos < 0 || pos > size {
 		return false, nil
 	}
@@ -224,7 +239,7 @@ func isFileUTF8Boundary(path string, pos int64, size int64) (bool, error) {
 	return utf8.RuneStart(buf[0]), nil
 }
 
-func previewTextFromFile(path string, start int64, limit int) (string, error) {
+func PreviewTextFromFile(path string, start int64, limit int) (string, error) {
 	if limit <= 0 {
 		return "", nil
 	}

@@ -77,7 +77,7 @@ func TestLocalAPIServesDashboard(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("очікував 200 для OpenAPI, отримав %d: %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "openapi: 3.1.0") {
+	if !strings.Contains(rec.Body.String(), "openapi: 3.0.3") {
 		t.Fatalf("OpenAPI відповідь не схожа на YAML contract")
 	}
 }
@@ -109,10 +109,18 @@ func TestServerShutdownWithOpenSSE(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
+		api.BeginShutdown()
 		cancelServe()
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		done <- server.Shutdown(ctx)
+
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
+		shutdownErr := server.Shutdown(shutdownCtx)
+		cancelShutdown()
+
+		playbackCtx, cancelPlayback := context.WithTimeout(context.Background(), time.Second)
+		_, playbackErr := api.playback.Stop(playbackCtx)
+		cancelPlayback()
+
+		done <- errors.Join(shutdownErr, playbackErr)
 	}()
 
 	select {
@@ -126,6 +134,21 @@ func TestServerShutdownWithOpenSSE(t *testing.T) {
 
 	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
 		t.Fatalf("неочікувана помилка server.Serve: %v", err)
+	}
+}
+
+func TestLocalAPIRejectsPlaybackStartDuringShutdown(t *testing.T) {
+	api := newTestLocalAPI(t, nil)
+	registeredBook := addTestBook(t, api, writeTempBook(t, "Книга."))
+
+	api.BeginShutdown()
+
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{
+		BookID: registeredBook.ID,
+	})
+	assertErrorCode(t, rec, http.StatusServiceUnavailable, "service_shutting_down")
+	if snapshot := api.playback.Snapshot(); snapshot.State != playbackStopped {
+		t.Fatalf("shutdown request запустив playback: %#v", snapshot)
 	}
 }
 

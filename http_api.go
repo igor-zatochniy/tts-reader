@@ -12,44 +12,23 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/igor-zatochniy/tts-reader/internal/book"
+	"github.com/igor-zatochniy/tts-reader/internal/chunk"
+	apidto "github.com/igor-zatochniy/tts-reader/internal/httpapi"
+	"github.com/igor-zatochniy/tts-reader/internal/playback"
+	"github.com/igor-zatochniy/tts-reader/internal/progress"
+	"github.com/igor-zatochniy/tts-reader/internal/tts"
 )
 
 type LocalAPI struct {
-	store    *BookStore
-	playback *PlaybackManager
-	engines  engineFactory
-	token    string
-}
-
-type ErrorResponse struct {
-	Code     string                  `json:"code"`
-	Error    string                  `json:"error"`
-	Playback *PublicPlaybackSnapshot `json:"playback,omitempty"`
-}
-
-type PublicPlaybackSnapshot struct {
-	State           string  `json:"state"`
-	BookID          string  `json:"book_id,omitempty"`
-	ProgressPercent float64 `json:"progress_percent"`
-	CurrentByte     int64   `json:"current_byte"`
-	Voice           string  `json:"voice,omitempty"`
-	ChunkSize       int     `json:"chunk_size,omitempty"`
-	ErrorCode       string  `json:"error_code,omitempty"`
-	Error           string  `json:"error,omitempty"`
-}
-
-type PublicPlaybackEvent struct {
-	Seq      uint64                 `json:"seq"`
-	Type     string                 `json:"type"`
-	Time     time.Time              `json:"time"`
-	Playback PublicPlaybackSnapshot `json:"playback"`
-}
-
-type PublicBook struct {
-	ID    string `json:"id"`
-	Title string `json:"title"`
-	Size  int64  `json:"size"`
+	store        *book.BookStore
+	playback     *playback.PlaybackManager
+	engines      tts.EngineFactory
+	token        string
+	shuttingDown atomic.Bool
 }
 
 func isAllowedOrigin(r *http.Request) bool {
@@ -75,7 +54,11 @@ func (api *LocalAPI) requiresToken(r *http.Request) bool {
 	if r.URL.Path == "/api/v1/events" {
 		return true
 	}
-	return r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch || r.Method == http.MethodDelete
+	return changesState(r.Method)
+}
+
+func changesState(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete
 }
 
 func (api *LocalAPI) authorized(r *http.Request) bool {
@@ -98,8 +81,14 @@ func requireJSONContentType(r *http.Request) error {
 	return nil
 }
 
-func NewLocalAPI(store *BookStore, playback *PlaybackManager, engines engineFactory, token string) *LocalAPI {
+func NewLocalAPI(store *book.BookStore, playback *playback.PlaybackManager, engines tts.EngineFactory, token string) *LocalAPI {
 	return &LocalAPI{store: store, playback: playback, engines: engines, token: token}
+}
+
+// BeginShutdown закриває API для нових запитів, які змінюють стан.
+func (api *LocalAPI) BeginShutdown() {
+	api.shuttingDown.Store(true)
+	api.playback.BeginShutdown()
 }
 
 func (api *LocalAPI) Routes() http.Handler {
@@ -130,6 +119,10 @@ func (api *LocalAPI) Routes() http.Handler {
 			writeError(w, http.StatusUnauthorized, "api_token_required", "API token is required")
 			return
 		}
+		if changesState(r.Method) && api.shuttingDown.Load() {
+			writeError(w, http.StatusServiceUnavailable, "service_shutting_down", "service is shutting down")
+			return
+		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -153,48 +146,60 @@ func (api *LocalAPI) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *LocalAPI) handleVoices(w http.ResponseWriter, r *http.Request) {
-	voices, err := api.engines(Config{}).Voices(r.Context())
+	voices, err := api.engines(tts.Config{}).Voices(r.Context())
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string][]Voice{"voices": voices})
+	publicVoices := make([]apidto.Voice, 0, len(voices))
+	for _, voice := range voices {
+		publicVoices = append(publicVoices, apidto.Voice{Name: voice.Name})
+	}
+	writeJSON(w, http.StatusOK, apidto.VoicesResponse{Voices: publicVoices})
 }
 
 func (api *LocalAPI) handleAddBook(w http.ResponseWriter, r *http.Request) {
-	var req AddBookRequest
+	var req apidto.AddBookRequest
 	if err := readJSON(w, r, &req); err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	book, err := api.store.Add(req)
+	registeredBook, err := api.store.Add(book.AddRequest{
+		Path:  req.Path,
+		Title: req.Title,
+	})
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, publicBook(book))
+	writeJSON(w, http.StatusCreated, publicBook(registeredBook))
 }
 
 func (api *LocalAPI) handleListBooks(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string][]PublicBook{"books": publicBooks(api.store.List())})
+	writeJSON(w, http.StatusOK, apidto.BooksResponse{Books: publicBooks(api.store.List())})
 }
 
 func (api *LocalAPI) handleStartPlayback(w http.ResponseWriter, r *http.Request) {
-	var req StartPlaybackRequest
-	if err := readJSON(w, r, &req); err != nil {
+	var request apidto.StartPlaybackRequest
+	if err := readJSON(w, r, &request); err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	if _, err := validateStartPlaybackRequest(req); err != nil {
+	req := playback.StartRequest{
+		BookID:    request.BookID,
+		Voice:     request.Voice,
+		ChunkSize: request.ChunkSize,
+	}
+	if _, err := playback.ValidateStartRequest(req); err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	book, ok := api.store.Get(req.BookID)
+	registeredBook, ok := api.store.Get(req.BookID)
 	if !ok {
-		writeAPIError(w, ErrBookNotFound)
+		writeAPIError(w, book.ErrNotFound)
 		return
 	}
-	snapshot, err := api.playback.Start(book, req)
+	snapshot, err := api.playback.Start(registeredBook, req)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -237,22 +242,26 @@ func (api *LocalAPI) handleStopPlayback(w http.ResponseWriter, r *http.Request) 
 }
 
 func (api *LocalAPI) handleSetPosition(w http.ResponseWriter, r *http.Request) {
-	var req SetPositionRequest
-	if err := readJSON(w, r, &req); err != nil {
+	var request apidto.SetPositionRequest
+	if err := readJSON(w, r, &request); err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	pos, err := validateSetPositionRequest(req)
+	req := playback.SetPositionRequest{
+		BookID:      request.BookID,
+		CurrentByte: request.CurrentByte,
+	}
+	pos, err := playback.ValidateSetPositionRequest(req)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	book, ok := api.store.Get(req.BookID)
+	registeredBook, ok := api.store.Get(req.BookID)
 	if !ok {
-		writeAPIError(w, ErrBookNotFound)
+		writeAPIError(w, book.ErrNotFound)
 		return
 	}
-	snapshot, err := api.playback.SetPosition(book, pos)
+	snapshot, err := api.playback.SetPosition(registeredBook, pos)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -331,42 +340,41 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func writePlaybackSnapshot(w http.ResponseWriter, status int, snapshot PlaybackSnapshot) {
+func writePlaybackSnapshot(w http.ResponseWriter, status int, snapshot playback.PlaybackSnapshot) {
 	writeJSON(w, status, publicPlaybackSnapshot(snapshot))
 }
 
 func writeError(w http.ResponseWriter, status int, code string, message string) {
-	writeJSON(w, status, ErrorResponse{Code: code, Error: message})
+	writeJSON(w, status, apidto.ErrorResponse{Code: code, Error: message})
 }
 
 func writeAPIError(w http.ResponseWriter, err error) {
 	logInternalError("http api", err)
-	writeJSON(w, statusForError(err), ErrorResponse{
+	writeJSON(w, statusForError(err), apidto.ErrorResponse{
 		Code:  codeForError(err),
 		Error: publicErrorMessageForError(err),
 	})
 }
 
-func writePlaybackError(w http.ResponseWriter, err error, snapshot PlaybackSnapshot) {
+func writePlaybackError(w http.ResponseWriter, err error, snapshot playback.PlaybackSnapshot) {
 	logInternalError("http api", err)
-	publicSnapshot := publicPlaybackSnapshot(snapshot)
-	writeJSON(w, statusForError(err), ErrorResponse{
+	writeJSON(w, statusForError(err), apidto.ErrorResponse{
 		Code:     codeForError(err),
 		Error:    publicErrorMessageForError(err),
-		Playback: &publicSnapshot,
+		Playback: publicPlaybackSnapshot(snapshot),
 	})
 }
 
-func publicPlaybackEvent(event PlaybackEvent) PublicPlaybackEvent {
-	return PublicPlaybackEvent{
-		Seq:      event.Seq,
-		Type:     event.Type,
+func publicPlaybackEvent(event playback.PlaybackEvent) apidto.PlaybackEvent {
+	return apidto.PlaybackEvent{
+		Seq:      int64(event.Seq),
+		Type:     apidto.PlaybackEventType(event.Type),
 		Time:     event.Time,
 		Playback: publicPlaybackSnapshot(event.Playback),
 	}
 }
 
-func writeSSEPlaybackEvent(w io.Writer, event PlaybackEvent) error {
+func writeSSEPlaybackEvent(w io.Writer, event playback.PlaybackEvent) error {
 	data, err := json.Marshal(publicPlaybackEvent(event))
 	if err != nil {
 		return err
@@ -381,29 +389,29 @@ func writeSSEPlaybackEvent(w io.Writer, event PlaybackEvent) error {
 	return err
 }
 
-func publicPlaybackSnapshot(snapshot PlaybackSnapshot) PublicPlaybackSnapshot {
-	public := PublicPlaybackSnapshot{
-		State:           snapshot.State,
+func publicPlaybackSnapshot(snapshot playback.PlaybackSnapshot) apidto.PlaybackState {
+	public := apidto.PlaybackState{
+		State:           apidto.PlaybackStateState(snapshot.State),
 		BookID:          snapshot.BookID,
 		ProgressPercent: snapshot.ProgressPercent,
 		CurrentByte:     snapshot.CurrentByte,
 		Voice:           snapshot.Voice,
 		ChunkSize:       snapshot.ChunkSize,
-		ErrorCode:       snapshot.ErrorCode,
+		ErrorCode:       apidto.PlaybackStateErrorCode(snapshot.ErrorCode),
 	}
 	if public.ErrorCode == "" {
 		return public
 	}
-	public.Error = publicErrorMessageForCode(public.ErrorCode)
+	public.Error = publicErrorMessageForCode(string(public.ErrorCode))
 	return public
 }
 
-func publicBook(book Book) PublicBook {
-	return PublicBook{ID: book.ID, Title: book.Title, Size: book.Size}
+func publicBook(book book.Book) apidto.Book {
+	return apidto.Book{ID: book.ID, Title: book.Title, Size: book.Size}
 }
 
-func publicBooks(books []Book) []PublicBook {
-	result := make([]PublicBook, 0, len(books))
+func publicBooks(books []book.Book) []apidto.Book {
+	result := make([]apidto.Book, 0, len(books))
 	for _, book := range books {
 		result = append(result, publicBook(book))
 	}
@@ -423,37 +431,39 @@ func publicErrorMessageForCode(code string) string {
 
 func publicErrorMessageForError(err error) string {
 	switch {
-	case errors.Is(err, ErrPlaybackActive):
+	case errors.Is(err, playback.ErrActive):
 		return "playback is already active"
-	case errors.Is(err, ErrPlaybackStopping):
+	case errors.Is(err, playback.ErrStopping):
 		return "playback is still stopping"
-	case errors.Is(err, ErrPlaybackNotPlaying):
+	case errors.Is(err, playback.ErrShuttingDown):
+		return "service is shutting down"
+	case errors.Is(err, playback.ErrNotPlaying):
 		return "playback is not playing"
-	case errors.Is(err, ErrPlaybackNotPaused):
+	case errors.Is(err, playback.ErrNotPaused):
 		return "playback is not paused"
-	case errors.Is(err, ErrBookModified):
+	case errors.Is(err, book.ErrModified):
 		return "book file changed after registration"
-	case errors.Is(err, ErrProgressBookMismatch):
+	case errors.Is(err, progress.ErrBookMismatch):
 		return "progress belongs to a different book"
-	case errors.Is(err, ErrProgressFormat):
+	case errors.Is(err, progress.ErrFormat):
 		return "unsupported progress format"
-	case errors.Is(err, ErrBookNotFound):
+	case errors.Is(err, book.ErrNotFound):
 		return "book not found"
-	case errors.Is(err, ErrBookNotReadable):
+	case errors.Is(err, book.ErrNotReadable):
 		return "book is not readable"
-	case errors.Is(err, ErrBookNotRegular):
+	case errors.Is(err, book.ErrNotRegular):
 		return "book must be a regular file"
-	case errors.Is(err, ErrPathRequired):
+	case errors.Is(err, book.ErrPathRequired):
 		return "path is required"
-	case errors.Is(err, ErrBookIDRequired):
+	case errors.Is(err, playback.ErrBookIDRequired):
 		return "book_id is required"
-	case errors.Is(err, ErrCurrentByteRequired):
+	case errors.Is(err, playback.ErrCurrentByteRequired):
 		return "current_byte is required"
-	case errors.Is(err, ErrPositionOutsideBook):
+	case errors.Is(err, progress.ErrPositionOutside):
 		return "position outside book"
-	case errors.Is(err, ErrPositionInsideRune):
+	case errors.Is(err, progress.ErrPositionInside):
 		return "position inside UTF-8 rune"
-	case errors.Is(err, ErrInvalidChunkSize):
+	case errors.Is(err, chunk.ErrInvalidSize):
 		return "invalid chunk_size"
 	case errors.Is(err, ErrUnsupportedMedia):
 		return "unsupported media type"
@@ -473,26 +483,28 @@ func logInternalError(scope string, err error) {
 
 func statusForError(err error) int {
 	switch {
-	case errors.Is(err, ErrPlaybackActive),
-		errors.Is(err, ErrPlaybackStopping),
-		errors.Is(err, ErrBookModified),
-		errors.Is(err, ErrProgressBookMismatch),
-		errors.Is(err, ErrProgressFormat),
-		errors.Is(err, ErrPlaybackNotPlaying),
-		errors.Is(err, ErrPlaybackNotPaused):
+	case errors.Is(err, playback.ErrActive),
+		errors.Is(err, playback.ErrStopping),
+		errors.Is(err, book.ErrModified),
+		errors.Is(err, progress.ErrBookMismatch),
+		errors.Is(err, progress.ErrFormat),
+		errors.Is(err, playback.ErrNotPlaying),
+		errors.Is(err, playback.ErrNotPaused):
 		return http.StatusConflict
-	case errors.Is(err, ErrBookNotFound):
+	case errors.Is(err, playback.ErrShuttingDown):
+		return http.StatusServiceUnavailable
+	case errors.Is(err, book.ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, ErrUnsupportedMedia):
 		return http.StatusUnsupportedMediaType
-	case errors.Is(err, ErrPathRequired),
-		errors.Is(err, ErrBookNotReadable),
-		errors.Is(err, ErrBookNotRegular),
-		errors.Is(err, ErrBookIDRequired),
-		errors.Is(err, ErrCurrentByteRequired),
-		errors.Is(err, ErrPositionOutsideBook),
-		errors.Is(err, ErrPositionInsideRune),
-		errors.Is(err, ErrInvalidChunkSize),
+	case errors.Is(err, book.ErrPathRequired),
+		errors.Is(err, book.ErrNotReadable),
+		errors.Is(err, book.ErrNotRegular),
+		errors.Is(err, playback.ErrBookIDRequired),
+		errors.Is(err, playback.ErrCurrentByteRequired),
+		errors.Is(err, progress.ErrPositionOutside),
+		errors.Is(err, progress.ErrPositionInside),
+		errors.Is(err, chunk.ErrInvalidSize),
 		errors.Is(err, ErrInvalidJSON):
 		return http.StatusBadRequest
 	default:
@@ -502,37 +514,39 @@ func statusForError(err error) int {
 
 func codeForError(err error) string {
 	switch {
-	case errors.Is(err, ErrPlaybackActive):
+	case errors.Is(err, playback.ErrActive):
 		return "playback_active"
-	case errors.Is(err, ErrPlaybackStopping):
+	case errors.Is(err, playback.ErrStopping):
 		return "playback_stopping"
-	case errors.Is(err, ErrPlaybackNotPlaying):
+	case errors.Is(err, playback.ErrShuttingDown):
+		return "service_shutting_down"
+	case errors.Is(err, playback.ErrNotPlaying):
 		return "playback_not_playing"
-	case errors.Is(err, ErrPlaybackNotPaused):
+	case errors.Is(err, playback.ErrNotPaused):
 		return "playback_not_paused"
-	case errors.Is(err, ErrBookModified):
+	case errors.Is(err, book.ErrModified):
 		return "book_modified"
-	case errors.Is(err, ErrProgressBookMismatch):
+	case errors.Is(err, progress.ErrBookMismatch):
 		return "progress_book_mismatch"
-	case errors.Is(err, ErrProgressFormat):
+	case errors.Is(err, progress.ErrFormat):
 		return "progress_format_unsupported"
-	case errors.Is(err, ErrBookNotFound):
+	case errors.Is(err, book.ErrNotFound):
 		return "book_not_found"
-	case errors.Is(err, ErrBookNotReadable):
+	case errors.Is(err, book.ErrNotReadable):
 		return "book_not_readable"
-	case errors.Is(err, ErrBookNotRegular):
+	case errors.Is(err, book.ErrNotRegular):
 		return "book_not_regular"
-	case errors.Is(err, ErrPathRequired):
+	case errors.Is(err, book.ErrPathRequired):
 		return "path_required"
-	case errors.Is(err, ErrBookIDRequired):
+	case errors.Is(err, playback.ErrBookIDRequired):
 		return "book_id_required"
-	case errors.Is(err, ErrCurrentByteRequired):
+	case errors.Is(err, playback.ErrCurrentByteRequired):
 		return "current_byte_required"
-	case errors.Is(err, ErrPositionOutsideBook):
+	case errors.Is(err, progress.ErrPositionOutside):
 		return "position_outside_book"
-	case errors.Is(err, ErrPositionInsideRune):
+	case errors.Is(err, progress.ErrPositionInside):
 		return "position_inside_utf8_rune"
-	case errors.Is(err, ErrInvalidChunkSize):
+	case errors.Is(err, chunk.ErrInvalidSize):
 		return "invalid_chunk_size"
 	case errors.Is(err, ErrUnsupportedMedia):
 		return "unsupported_media_type"

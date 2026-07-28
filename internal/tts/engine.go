@@ -1,15 +1,30 @@
-package core
+package tts
 
 import (
 	"context"
 	"sync"
+	"time"
 )
+
+type Config struct {
+	BookFile    string
+	SaveFile    string
+	StartPhrase string
+	Voice       string
+	ChunkSize   int
+	TTSTimeout  time.Duration
+}
+
+type SpeakFunc func(ctx context.Context, text string) error
+type SpeakerFactory func(cfg Config) SpeakFunc
+type VoiceProvider func() ([]string, error)
+type EngineFactory func(cfg Config) Engine
 
 type Voice struct {
 	Name string `json:"name"`
 }
 
-type TTSEngine interface {
+type Engine interface {
 	Speak(ctx context.Context, text string) error
 	Voices(ctx context.Context) ([]Voice, error)
 	Stop(ctx context.Context) error
@@ -17,14 +32,14 @@ type TTSEngine interface {
 
 type functionEngine struct {
 	mu      sync.Mutex
-	speaker speakFunc
-	voices  voiceProvider
+	speaker SpeakFunc
+	voices  VoiceProvider
 	stop    context.CancelFunc
 	done    chan struct{}
 }
 
-func newFunctionEngineFactory(makeSpeaker speakerFactory, voices voiceProvider) engineFactory {
-	return func(cfg Config) TTSEngine {
+func NewFunctionEngineFactory(makeSpeaker SpeakerFactory, voices VoiceProvider) EngineFactory {
+	return func(cfg Config) Engine {
 		return &functionEngine{
 			speaker: makeSpeaker(cfg),
 			voices:  voices,

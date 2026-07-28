@@ -25,15 +25,15 @@ flowchart LR
 
 ## Межі пакетів
 
-Після механічного поділу великих файлів доменна логіка винесена з `package main` в `internal/core`.
+Доменна логіка розділена на окремі internal packages:
 
-`internal/core` містить:
-
-- модель книги та in-memory `BookStore`;
-- streaming chunk reader і UTF-8 byte-boundary helpers;
-- `ProgressStore` і прив'язку progress до fingerprint книги;
-- `TTSEngine` abstraction;
-- `PlaybackManager`, session lifecycle і `EventBroker`.
+- `internal/book` відповідає за модель книги, in-memory registry, абсолютні шляхи та file identity checks.
+- `internal/chunk` містить streaming reader, smart chunk boundaries, UTF-8 byte-boundary helpers і пошук стартової фрази.
+- `internal/progress` відповідає за JSON progress format, прив'язку progress до книги й атомарну заміну progress-файла.
+- `internal/tts` містить TTS interfaces, voice model і function-based engine adapter.
+- `internal/events` містить generic event broker з backpressure policy.
+- `internal/playback` збирає book, chunk, progress, tts та events у playback state machine.
+- `internal/httpapi` містить DTO, згенеровані з `api/openapi.yaml`; handlers перетворюють ці transport types на доменні запити.
 
 Root package лишається application layer:
 
@@ -42,9 +42,9 @@ Root package лишається application layer:
 - dashboard;
 - platform entrypoints для Windows SAPI.
 
-Це дає реальну компіляторну межу: HTTP handlers і зовнішні тести більше не можуть звертатися до `PlaybackManager.mu`, `active`, `state`, `fail(...)` або lifecycle hooks. Низькорівневі adversarial-тести, які перевіряють stale sessions, durable position і race invariants, живуть поруч із доменним кодом у `internal/core`.
+Це дає реальні компіляторні межі: HTTP handlers не мають доступу до приватних полів `PlaybackManager`, progress package не знає про HTTP, generic event broker не знає про playback snapshot, OpenAPI DTO не містять доменної логіки, а Windows SAPI adapter залежить лише від `internal/tts`.
 
-Наступний природний крок без зміни поведінки - розділити `internal/core` на менші пакети (`playback`, `book`, `progress`, `events`, `tts`). Поточний етап спеціально обмежений одним доменним пакетом, щоб не змішувати зміну lifecycle-логіки з широким переміщенням файлів.
+Низькорівневі adversarial-тести, які перевіряють stale sessions, durable position і race invariants, живуть поруч із state machine в `internal/playback`.
 
 ### HTTP -> playback engine -> chunk reader -> Windows SAPI
 

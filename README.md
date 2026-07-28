@@ -136,7 +136,7 @@ api/openapi.yaml
 http://127.0.0.1:8080/api/openapi.yaml
 ```
 
-API DTO у Go-коді відповідають схемам OpenAPI (`AddBookRequest`, `StartPlaybackRequest`, `SetPositionRequest`, `PublicBook`, `Voice`, `PlaybackState`). TTS backend ізольований через `TTSEngine`, тому HTTP handlers і тести не залежать від реального Windows audio.
+`api/openapi.yaml` є джерелом істини для HTTP DTO. Типи `AddBookRequest`, `StartPlaybackRequest`, `SetPositionRequest`, `Book`, `Voice`, `PlaybackState`, `PlaybackEvent` та `ErrorResponse` генеруються в `internal/httpapi/types.gen.go` за допомогою закріпленої версії `oapi-codegen`. TTS backend ізольований через `TTSEngine`, тому HTTP handlers і тести не залежать від реального Windows audio.
 
 Security model:
 
@@ -242,6 +242,8 @@ position.updated
 ```powershell
 go mod verify
 npx --yes @redocly/cli@2.38.0 lint api/openapi.yaml
+go generate ./internal/httpapi
+git diff --exit-code -- internal/httpapi/types.gen.go
 go test ./...
 go test -race ./...
 go vet ./...
@@ -319,7 +321,7 @@ Benchmark matrix містить ASCII і UTF-8 книги розміром 1 MB,
 
 ## CI
 
-GitHub Actions workflow у `.github/workflows/ci.yml` запускається на `windows-latest` і перевіряє форматування, OpenAPI contract, модулі, тести, race detector, `go vet`, `staticcheck`, `govulncheck` та збірку.
+GitHub Actions workflow у `.github/workflows/ci.yml` запускається на `windows-latest` і перевіряє форматування, OpenAPI contract, актуальність згенерованих DTO, модулі, тести, race detector, `go vet`, `staticcheck`, `govulncheck` та збірку.
 
 Release workflow у `.github/workflows/release.yml` запускається на tags `v*`, збирає `tts-reader-windows-amd64.exe`, створює SHA256 checksum і публікує обидва артефакти в GitHub Release.
 

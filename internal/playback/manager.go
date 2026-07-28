@@ -1,4 +1,4 @@
-package core
+package playback
 
 import (
 	"context"
@@ -8,7 +8,33 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	bookpkg "github.com/igor-zatochniy/tts-reader/internal/book"
+	"github.com/igor-zatochniy/tts-reader/internal/chunk"
+	"github.com/igor-zatochniy/tts-reader/internal/events"
+	"github.com/igor-zatochniy/tts-reader/internal/progress"
+	"github.com/igor-zatochniy/tts-reader/internal/tts"
+)
+
+const (
+	Stopped  = "stopped"
+	Stopping = "stopping"
+	Playing  = "playing"
+	Paused   = "paused"
+	Finished = "finished"
+	Failed   = "failed"
+)
+
+var (
+	ErrActive              = errors.New("playback active")
+	ErrStopping            = errors.New("playback stopping")
+	ErrNotPlaying          = errors.New("playback not playing")
+	ErrNotPaused           = errors.New("playback not paused")
+	ErrShuttingDown        = errors.New("playback manager shutting down")
+	ErrBookIDRequired      = errors.New("book_id required")
+	ErrCurrentByteRequired = errors.New("current_byte required")
 )
 
 type PlaybackSnapshot struct {
@@ -19,6 +45,66 @@ type PlaybackSnapshot struct {
 	Voice           string  `json:"voice,omitempty"`
 	ChunkSize       int     `json:"chunk_size,omitempty"`
 	ErrorCode       string  `json:"error_code,omitempty"`
+}
+
+type StartRequest struct {
+	BookID    string `json:"book_id"`
+	Voice     string `json:"voice,omitempty"`
+	ChunkSize *int   `json:"chunk_size,omitempty"`
+}
+
+type SetPositionRequest struct {
+	BookID      string `json:"book_id"`
+	CurrentByte *int64 `json:"current_byte"`
+}
+
+type PlaybackEvent struct {
+	Seq      uint64           `json:"seq"`
+	Type     string           `json:"type"`
+	Time     time.Time        `json:"time"`
+	Playback PlaybackSnapshot `json:"playback"`
+}
+
+type EventBroker struct {
+	broker *events.Broker[PlaybackEvent]
+}
+
+type EngineFactory = tts.EngineFactory
+type ProgressStore = progress.ProgressStore
+type TTSEngine = tts.Engine
+
+func NewEventBroker() *EventBroker {
+	return &EventBroker{
+		broker: events.NewBroker(events.Options[PlaybackEvent]{
+			IsLossy: func(event PlaybackEvent) bool {
+				return event.Type == "chunk.started" || event.Type == "progress.updated"
+			},
+			Sequence: func(event PlaybackEvent) uint64 {
+				return event.Seq
+			},
+			WithMetadata: func(event PlaybackEvent, seq uint64, at time.Time) PlaybackEvent {
+				event.Seq = seq
+				event.Time = at
+				return event
+			},
+		}),
+	}
+}
+
+func (b *EventBroker) Subscribe() (<-chan PlaybackEvent, func()) {
+	return b.broker.Subscribe()
+}
+
+func (b *EventBroker) NewEvent(eventType string, snapshot PlaybackSnapshot) PlaybackEvent {
+	return b.broker.NewEvent(PlaybackEvent{Type: eventType, Playback: snapshot})
+}
+
+func (b *EventBroker) Publish(event PlaybackEvent) {
+	b.broker.Publish(event)
+}
+
+func (b *EventBroker) PublishPlayback(eventType string, snapshot PlaybackSnapshot) {
+	b.broker.Publish(PlaybackEvent{Type: eventType, Playback: snapshot})
 }
 
 type playbackSession struct {
@@ -34,13 +120,13 @@ type PlaybackManager struct {
 	controlMu  sync.Mutex
 	mu         sync.Mutex
 	cond       *sync.Cond
-	engines    engineFactory
+	engines    EngineFactory
 	ttsTimeout time.Duration
 	events     *EventBroker
 	progress   ProgressStore
 
 	state             string
-	book              Book
+	book              bookpkg.Book
 	currentByte       int64
 	currentChunkStart int64
 	durablePosition   int64
@@ -49,29 +135,23 @@ type PlaybackManager struct {
 	lastErr           error
 	nextID            uint64
 	active            *playbackSession
+	shuttingDown      atomic.Bool
 }
 
-func validateStartPlaybackRequest(req StartPlaybackRequest) (int, error) {
+func ValidateStartRequest(req StartRequest) (int, error) {
 	if strings.TrimSpace(req.BookID) == "" {
 		return 0, ErrBookIDRequired
 	}
 	if req.ChunkSize == nil {
-		return defaultChunkSize, nil
+		return chunk.DefaultSize, nil
 	}
-	if err := validateChunkSize(*req.ChunkSize); err != nil {
+	if err := chunk.ValidateSize(*req.ChunkSize); err != nil {
 		return 0, err
 	}
 	return *req.ChunkSize, nil
 }
 
-func validateChunkSize(size int) error {
-	if size < 1 || size > maxChunkSize {
-		return fmt.Errorf("%w: chunk_size must be between 1 and %d", ErrInvalidChunkSize, maxChunkSize)
-	}
-	return nil
-}
-
-func validateSetPositionRequest(req SetPositionRequest) (int64, error) {
+func ValidateSetPositionRequest(req SetPositionRequest) (int64, error) {
 	if strings.TrimSpace(req.BookID) == "" {
 		return 0, ErrBookIDRequired
 	}
@@ -79,46 +159,50 @@ func validateSetPositionRequest(req SetPositionRequest) (int64, error) {
 		return 0, ErrCurrentByteRequired
 	}
 	if *req.CurrentByte < 0 {
-		return 0, ErrPositionOutsideBook
+		return 0, progress.ErrPositionOutside
 	}
 	return *req.CurrentByte, nil
 }
 
-func NewPlaybackManager(engines engineFactory, ttsTimeout time.Duration, events *EventBroker) *PlaybackManager {
-	return NewPlaybackManagerWithProgress(engines, ttsTimeout, events, JSONProgressStore{})
+func NewManager(engines EngineFactory, ttsTimeout time.Duration, events *EventBroker) *PlaybackManager {
+	return NewManagerWithProgress(engines, ttsTimeout, events, progress.JSONProgressStore{})
 }
 
-func NewPlaybackManagerWithProgress(engines engineFactory, ttsTimeout time.Duration, events *EventBroker, progress ProgressStore) *PlaybackManager {
-	if progress == nil {
-		progress = JSONProgressStore{}
+func NewManagerWithProgress(engines EngineFactory, ttsTimeout time.Duration, events *EventBroker, progressStore ProgressStore) *PlaybackManager {
+	if progressStore == nil {
+		progressStore = progress.JSONProgressStore{}
 	}
 	m := &PlaybackManager{
 		engines:    engines,
 		ttsTimeout: ttsTimeout,
 		events:     events,
-		progress:   progress,
-		state:      playbackStopped,
-		chunkSize:  defaultChunkSize,
+		progress:   progressStore,
+		state:      Stopped,
+		chunkSize:  chunk.DefaultSize,
 	}
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
 
-func (m *PlaybackManager) Start(book Book, req StartPlaybackRequest) (PlaybackSnapshot, error) {
+func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSnapshot, error) {
 	m.controlMu.Lock()
 	defer m.controlMu.Unlock()
 
-	chunkSize, err := validateStartPlaybackRequest(req)
+	if m.shuttingDown.Load() {
+		return PlaybackSnapshot{}, ErrShuttingDown
+	}
+
+	chunkSize, err := ValidateStartRequest(req)
 	if err != nil {
 		return PlaybackSnapshot{}, err
 	}
 
-	currentFile, err := inspectBookFile(book.Path)
+	currentFile, err := bookpkg.InspectFile(book.Path)
 	if err != nil {
 		return PlaybackSnapshot{}, fmt.Errorf("inspect current book file: %w", err)
 	}
-	if !sameBookFile(book.File, currentFile) {
-		return PlaybackSnapshot{}, fmt.Errorf("%w: book file changed after registration", ErrBookModified)
+	if !bookpkg.SameFile(book.File, currentFile) {
+		return PlaybackSnapshot{}, fmt.Errorf("%w: book file changed after registration", bookpkg.ErrModified)
 	}
 	book.Size = currentFile.Size
 	book.File = currentFile
@@ -127,9 +211,12 @@ func (m *PlaybackManager) Start(book Book, req StartPlaybackRequest) (PlaybackSn
 	if err != nil {
 		return PlaybackSnapshot{}, err
 	}
+	if m.shuttingDown.Load() {
+		return PlaybackSnapshot{}, ErrShuttingDown
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	engine := m.engines(Config{
+	engine := m.engines(tts.Config{
 		BookFile:   book.Path,
 		SaveFile:   book.SaveFile,
 		Voice:      req.Voice,
@@ -137,16 +224,21 @@ func (m *PlaybackManager) Start(book Book, req StartPlaybackRequest) (PlaybackSn
 		TTSTimeout: m.ttsTimeout,
 	})
 
-	m.mu.Lock()
-	if m.state == playbackStopping {
-		m.mu.Unlock()
+	if m.shuttingDown.Load() {
 		cancel()
-		return PlaybackSnapshot{}, ErrPlaybackStopping
+		return PlaybackSnapshot{}, ErrShuttingDown
 	}
-	if m.active != nil || m.state == playbackPlaying || m.state == playbackPaused {
+
+	m.mu.Lock()
+	if m.state == Stopping {
 		m.mu.Unlock()
 		cancel()
-		return PlaybackSnapshot{}, ErrPlaybackActive
+		return PlaybackSnapshot{}, ErrStopping
+	}
+	if m.active != nil || m.state == Playing || m.state == Paused {
+		m.mu.Unlock()
+		cancel()
+		return PlaybackSnapshot{}, ErrActive
 	}
 	m.nextID++
 	session := &playbackSession{
@@ -156,7 +248,7 @@ func (m *PlaybackManager) Start(book Book, req StartPlaybackRequest) (PlaybackSn
 		done:   make(chan struct{}),
 		engine: engine,
 	}
-	m.state = playbackPlaying
+	m.state = Playing
 	m.book = book
 	m.currentByte = startPos
 	m.currentChunkStart = startPos
@@ -177,13 +269,17 @@ func (m *PlaybackManager) Pause() (PlaybackSnapshot, error) {
 	m.controlMu.Lock()
 	defer m.controlMu.Unlock()
 
+	if m.shuttingDown.Load() {
+		return m.Snapshot(), ErrShuttingDown
+	}
+
 	m.mu.Lock()
-	if m.state != playbackPlaying {
+	if m.state != Playing {
 		snapshot := m.snapshotLocked()
 		m.mu.Unlock()
-		return snapshot, ErrPlaybackNotPlaying
+		return snapshot, ErrNotPlaying
 	}
-	m.state = playbackPaused
+	m.state = Paused
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
 
@@ -195,13 +291,17 @@ func (m *PlaybackManager) Resume() (PlaybackSnapshot, error) {
 	m.controlMu.Lock()
 	defer m.controlMu.Unlock()
 
+	if m.shuttingDown.Load() {
+		return m.Snapshot(), ErrShuttingDown
+	}
+
 	m.mu.Lock()
-	if m.state != playbackPaused {
+	if m.state != Paused {
 		snapshot := m.snapshotLocked()
 		m.mu.Unlock()
-		return snapshot, ErrPlaybackNotPaused
+		return snapshot, ErrNotPaused
 	}
-	m.state = playbackPlaying
+	m.state = Playing
 	m.cond.Broadcast()
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
@@ -219,7 +319,7 @@ func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
 	}
 
 	var session *playbackSession
-	var book Book
+	var book bookpkg.Book
 
 	m.mu.Lock()
 	session = m.active
@@ -227,10 +327,10 @@ func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
 		book = m.book
 	}
 	if session != nil {
-		m.state = playbackStopping
+		m.state = Stopping
 		session.stopWaitActive = true
 	} else {
-		m.state = playbackStopped
+		m.state = Stopped
 	}
 	m.lastErr = nil
 	snapshot := m.snapshotLocked()
@@ -299,17 +399,17 @@ func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
 		}
 	}
 	if publishStopped {
-		m.state = playbackStopped
+		m.state = Stopped
 		if book.ID != "" {
 			m.currentByte = pos
 			m.currentChunkStart = pos
 		}
 	} else if session != nil && m.active == session {
-		m.state = playbackStopping
+		m.state = Stopping
 		stillStopping = true
 	}
 	if stillStopping {
-		stopErr = errors.Join(stopErr, ErrPlaybackStopping)
+		stopErr = errors.Join(stopErr, ErrStopping)
 	}
 	m.lastErr = stopErr
 	snapshot = m.snapshotLocked()
@@ -321,42 +421,46 @@ func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
 	return snapshot, stopErr
 }
 
-func (m *PlaybackManager) SetPosition(book Book, pos int64) (PlaybackSnapshot, error) {
+func (m *PlaybackManager) SetPosition(book bookpkg.Book, pos int64) (PlaybackSnapshot, error) {
 	m.controlMu.Lock()
 	defer m.controlMu.Unlock()
 
-	m.mu.Lock()
-	if m.state == playbackStopping {
-		snapshot := m.snapshotLocked()
-		m.mu.Unlock()
-		return snapshot, ErrPlaybackStopping
+	if m.shuttingDown.Load() {
+		return m.Snapshot(), ErrShuttingDown
 	}
-	if m.active != nil || m.state == playbackPlaying || m.state == playbackPaused {
+
+	m.mu.Lock()
+	if m.state == Stopping {
 		snapshot := m.snapshotLocked()
 		m.mu.Unlock()
-		return snapshot, ErrPlaybackActive
+		return snapshot, ErrStopping
+	}
+	if m.active != nil || m.state == Playing || m.state == Paused {
+		snapshot := m.snapshotLocked()
+		m.mu.Unlock()
+		return snapshot, ErrActive
 	}
 	m.mu.Unlock()
 
-	currentFile, err := inspectBookFile(book.Path)
+	currentFile, err := bookpkg.InspectFile(book.Path)
 	if err != nil {
 		return PlaybackSnapshot{}, fmt.Errorf("inspect current book file: %w", err)
 	}
-	if !sameBookFile(book.File, currentFile) {
-		return PlaybackSnapshot{}, fmt.Errorf("%w: book file changed after registration", ErrBookModified)
+	if !bookpkg.SameFile(book.File, currentFile) {
+		return PlaybackSnapshot{}, fmt.Errorf("%w: book file changed after registration", bookpkg.ErrModified)
 	}
 	book.Size = currentFile.Size
 	book.File = currentFile
 
 	if pos < 0 || pos > currentFile.Size {
-		return PlaybackSnapshot{}, ErrPositionOutsideBook
+		return PlaybackSnapshot{}, progress.ErrPositionOutside
 	}
-	ok, err := isFileUTF8Boundary(book.Path, pos, currentFile.Size)
+	ok, err := chunk.IsFileUTF8Boundary(book.Path, pos, currentFile.Size)
 	if err != nil {
 		return PlaybackSnapshot{}, fmt.Errorf("check UTF-8 boundary: %w", err)
 	}
 	if !ok {
-		return PlaybackSnapshot{}, ErrPositionInsideRune
+		return PlaybackSnapshot{}, progress.ErrPositionInside
 	}
 	if err := m.progress.Save(book, pos); err != nil {
 		return PlaybackSnapshot{}, fmt.Errorf("save position: %w", err)
@@ -367,7 +471,7 @@ func (m *PlaybackManager) SetPosition(book Book, pos int64) (PlaybackSnapshot, e
 	m.currentByte = pos
 	m.currentChunkStart = pos
 	m.durablePosition = pos
-	m.state = playbackStopped
+	m.state = Stopped
 	m.lastErr = nil
 	snapshot := m.snapshotLocked()
 	m.mu.Unlock()
@@ -382,11 +486,16 @@ func (m *PlaybackManager) Snapshot() PlaybackSnapshot {
 	return m.snapshotLocked()
 }
 
+// BeginShutdown забороняє запуск нових операцій відтворення перед фінальним Stop.
+func (m *PlaybackManager) BeginShutdown() {
+	m.shuttingDown.Store(true)
+}
+
 func (m *PlaybackManager) Events() *EventBroker {
 	return m.events
 }
 
-func (m *PlaybackManager) play(session *playbackSession, book Book, startPos int64, chunkSize int) {
+func (m *PlaybackManager) play(session *playbackSession, book bookpkg.Book, startPos int64, chunkSize int) {
 	defer m.clearActiveSession(session.id)
 	defer close(session.done)
 
@@ -402,7 +511,7 @@ func (m *PlaybackManager) play(session *playbackSession, book Book, startPos int
 		return
 	}
 
-	reader, err := NewStreamingChunkReader(file, startPos, chunkSize)
+	reader, err := chunk.NewStreamingReader(file, startPos, chunkSize)
 	if err != nil {
 		m.fail(session.id, book, startPos, err)
 		return
@@ -446,10 +555,10 @@ func (m *PlaybackManager) play(session *playbackSession, book Book, startPos int
 func (m *PlaybackManager) waitUntilPlayable(session *playbackSession) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for m.state == playbackPaused && session.ctx.Err() == nil && m.active == session {
+	for m.state == Paused && session.ctx.Err() == nil && m.active == session {
 		m.cond.Wait()
 	}
-	return session.ctx.Err() == nil && m.state == playbackPlaying && m.active == session
+	return session.ctx.Err() == nil && m.state == Playing && m.active == session
 }
 
 func (m *PlaybackManager) current() int64 {
@@ -464,7 +573,7 @@ func (m *PlaybackManager) updateProgress(sessionID uint64, eventType string, pos
 		m.mu.Unlock()
 		return
 	}
-	if m.state != playbackPlaying && m.state != playbackPaused {
+	if m.state != Playing && m.state != Paused {
 		m.mu.Unlock()
 		return
 	}
@@ -478,7 +587,7 @@ func (m *PlaybackManager) updateProgress(sessionID uint64, eventType string, pos
 	m.publish(eventType, snapshot)
 }
 
-func (m *PlaybackManager) finish(sessionID uint64, book Book) {
+func (m *PlaybackManager) finish(sessionID uint64, book bookpkg.Book) {
 	if !m.isActiveSession(sessionID) {
 		return
 	}
@@ -489,11 +598,11 @@ func (m *PlaybackManager) finish(sessionID uint64, book Book) {
 	}
 
 	m.mu.Lock()
-	if !m.sessionIsActiveLocked(sessionID) || m.state == playbackStopped || m.state == playbackStopping {
+	if !m.sessionIsActiveLocked(sessionID) || m.state == Stopped || m.state == Stopping {
 		m.mu.Unlock()
 		return
 	}
-	m.state = playbackFinished
+	m.state = Finished
 	m.currentByte = book.Size
 	m.currentChunkStart = book.Size
 	m.durablePosition = 0
@@ -505,7 +614,7 @@ func (m *PlaybackManager) finish(sessionID uint64, book Book) {
 	m.publish("playback.finished", snapshot)
 }
 
-func (m *PlaybackManager) fail(sessionID uint64, book Book, pos int64, err error) {
+func (m *PlaybackManager) fail(sessionID uint64, book bookpkg.Book, pos int64, err error) {
 	if !m.isActiveSession(sessionID) {
 		return
 	}
@@ -514,11 +623,11 @@ func (m *PlaybackManager) fail(sessionID uint64, book Book, pos int64, err error
 	finalErr := errors.Join(err, saveErr)
 
 	m.mu.Lock()
-	if !m.sessionIsActiveLocked(sessionID) || m.state == playbackStopped || m.state == playbackStopping {
+	if !m.sessionIsActiveLocked(sessionID) || m.state == Stopped || m.state == Stopping {
 		m.mu.Unlock()
 		return
 	}
-	m.state = playbackFailed
+	m.state = Failed
 	m.currentByte = pos
 	m.currentChunkStart = pos
 	m.lastErr = finalErr
@@ -534,11 +643,11 @@ func (m *PlaybackManager) fail(sessionID uint64, book Book, pos int64, err error
 
 func (m *PlaybackManager) completeWithPersistenceFailure(sessionID uint64, pos int64, err error) {
 	m.mu.Lock()
-	if !m.sessionIsActiveLocked(sessionID) || m.state == playbackStopped || m.state == playbackStopping {
+	if !m.sessionIsActiveLocked(sessionID) || m.state == Stopped || m.state == Stopping {
 		m.mu.Unlock()
 		return
 	}
-	m.state = playbackFailed
+	m.state = Failed
 	m.currentByte = pos
 	m.currentChunkStart = pos
 	m.lastErr = err
@@ -552,7 +661,7 @@ func (m *PlaybackManager) completeWithPersistenceFailure(sessionID uint64, pos i
 func (m *PlaybackManager) isActiveSession(sessionID uint64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.sessionIsActiveLocked(sessionID) && m.state != playbackStopped && m.state != playbackStopping
+	return m.sessionIsActiveLocked(sessionID) && m.state != Stopped && m.state != Stopping
 }
 
 func (m *PlaybackManager) sessionIsActiveLocked(sessionID uint64) bool {
@@ -571,9 +680,9 @@ func (m *PlaybackManager) clearActiveSession(sessionID uint64) {
 	m.mu.Lock()
 	var snapshot PlaybackSnapshot
 	publishStopped := false
-	if m.active != nil && m.active.id == sessionID && m.state == playbackStopping && !m.active.stopWaitActive {
+	if m.active != nil && m.active.id == sessionID && m.state == Stopping && !m.active.stopWaitActive {
 		m.active = nil
-		m.state = playbackStopped
+		m.state = Stopped
 		m.currentByte = m.durablePosition
 		m.currentChunkStart = m.durablePosition
 		m.lastErr = nil
@@ -592,7 +701,7 @@ func (m *PlaybackManager) snapshotLocked() PlaybackSnapshot {
 	return PlaybackSnapshot{
 		State:           m.state,
 		BookID:          m.book.ID,
-		ProgressPercent: progressPercent(m.currentByte, total),
+		ProgressPercent: progress.Percent(m.currentByte, total),
 		CurrentByte:     m.currentByte,
 		Voice:           m.voice,
 		ChunkSize:       m.chunkSize,
@@ -604,7 +713,7 @@ func playbackErrorCode(err error) string {
 	if err == nil {
 		return ""
 	}
-	if errors.Is(err, ErrPlaybackStopping) {
+	if errors.Is(err, ErrStopping) {
 		return "playback_stopping"
 	}
 	return "internal_error"

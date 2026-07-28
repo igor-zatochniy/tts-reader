@@ -13,6 +13,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/igor-zatochniy/tts-reader/internal/book"
+	"github.com/igor-zatochniy/tts-reader/internal/chunk"
+	"github.com/igor-zatochniy/tts-reader/internal/progress"
+	"github.com/igor-zatochniy/tts-reader/internal/tts"
 )
 
 const (
@@ -21,24 +26,24 @@ const (
 )
 
 type App struct {
-	cfg     Config
-	speaker speakFunc
+	cfg     tts.Config
+	speaker tts.SpeakFunc
 	stdout  io.Writer
 	stderr  io.Writer
 	ctx     context.Context
 	pos     atomic.Int64
-	book    BookFileIdentity
+	book    book.FileIdentity
 }
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, newSpeaker))
 }
 
-func run(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactory) int {
+func run(args []string, stdout, stderr io.Writer, makeSpeaker tts.SpeakerFactory) int {
 	return runWithOptions(args, stdout, stderr, makeSpeaker, true)
 }
 
-func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speakerFactory, enableSignals bool) (exitCode int) {
+func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.SpeakerFactory, enableSignals bool) (exitCode int) {
 	if len(args) > 0 {
 		switch args[0] {
 		case "serve":
@@ -83,7 +88,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 		}
 	}()
 
-	bookIdentity, err := inspectBookFile(cfg.BookFile)
+	bookIdentity, err := book.InspectFile(cfg.BookFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося прочитати файл книги %q: %v\n", cfg.BookFile, err)
 		return 1
@@ -110,7 +115,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 	}
 	app.pos.Store(startPos)
 
-	preview, err := previewTextFromFile(cfg.BookFile, startPos, previewRuneLimit)
+	preview, err := chunk.PreviewTextFromFile(cfg.BookFile, startPos, previewRuneLimit)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося прочитати попередній перегляд книги: %v\n", err)
 		return 1
@@ -124,7 +129,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 	} else {
 		fmt.Fprintf(stdout, "Голос: %s\n", cfg.Voice)
 	}
-	fmt.Fprintf(stdout, "Прогрес: %.2f%%\n", progressPercent(startPos, bookSize))
+	fmt.Fprintf(stdout, "Прогрес: %.2f%%\n", progress.Percent(startPos, bookSize))
 	fmt.Fprintf(stdout, "Текст: \"...%s...\"\n", preview)
 	fmt.Fprintln(stdout, "Ctrl+C для виходу.")
 	fmt.Fprintln(stdout, "------------------------------------------------")
@@ -141,7 +146,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 		return 1
 	}
 
-	reader, err := NewStreamingChunkReader(book, startPos, cfg.ChunkSize)
+	reader, err := chunk.NewStreamingReader(book, startPos, cfg.ChunkSize)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: %v\n", err)
 		return 1
@@ -192,29 +197,29 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker speaker
 	return 0
 }
 
-func parseConfig(args []string, output io.Writer) (Config, error) {
+func parseConfig(args []string, output io.Writer) (tts.Config, error) {
 	fs := flag.NewFlagSet("audiobook", flag.ContinueOnError)
 	fs.SetOutput(output)
 
-	cfg := Config{}
+	cfg := tts.Config{}
 	fs.StringVar(&cfg.BookFile, "book", "book.txt", "Шлях до текстового файлу книги")
 	fs.StringVar(&cfg.SaveFile, "save", "", "Шлях до файлу прогресу")
 	fs.StringVar(&cfg.StartPhrase, "start", "", "Фраза для старту, яка ігнорує збережений прогрес")
 	fs.StringVar(&cfg.Voice, "voice", "", "Точна назва голосу Windows SAPI")
-	fs.IntVar(&cfg.ChunkSize, "chunk", defaultChunkSize, "Розмір фрагмента для озвучення у символах")
+	fs.IntVar(&cfg.ChunkSize, "chunk", chunk.DefaultSize, "Розмір фрагмента для озвучення у символах")
 	fs.DurationVar(&cfg.TTSTimeout, "tts-timeout", defaultTTSTimeout, "Максимальний час очікування одного TTS-фрагмента")
 
 	if err := fs.Parse(args); err != nil {
-		return Config{}, err
+		return tts.Config{}, err
 	}
-	if err := validateChunkSize(cfg.ChunkSize); err != nil {
-		return Config{}, fmt.Errorf("значення -chunk має бути між 1 і %d: %w", maxChunkSize, err)
+	if err := chunk.ValidateSize(cfg.ChunkSize); err != nil {
+		return tts.Config{}, fmt.Errorf("значення -chunk має бути між 1 і %d: %w", chunk.MaxSize, err)
 	}
 	if cfg.TTSTimeout <= 0 {
-		return Config{}, fmt.Errorf("значення -tts-timeout має бути більшим за 0")
+		return tts.Config{}, fmt.Errorf("значення -tts-timeout має бути більшим за 0")
 	}
 	if strings.TrimSpace(cfg.SaveFile) == "" {
-		cfg.SaveFile = defaultProgressPath(cfg.BookFile)
+		cfg.SaveFile = book.DefaultProgressPath(cfg.BookFile)
 	}
 	return cfg, nil
 }
@@ -222,7 +227,7 @@ func parseConfig(args []string, output io.Writer) (Config, error) {
 func (a *App) resolveStartPosition(bookSize int64) (int64, error) {
 	if a.cfg.StartPhrase != "" {
 		fmt.Fprintf(a.stdout, "--- ПОШУК ФРАЗИ: %q ---\n", a.cfg.StartPhrase)
-		idx, found, err := findPhraseOffset(a.cfg.BookFile, a.cfg.StartPhrase)
+		idx, found, err := chunk.FindPhraseOffset(a.cfg.BookFile, a.cfg.StartPhrase)
 		if err != nil {
 			return 0, fmt.Errorf("не вдалося знайти стартову фразу: %w", err)
 		}
@@ -247,7 +252,7 @@ func (a *App) resolveStartPosition(bookSize int64) (int64, error) {
 	return 0, nil
 }
 
-func (a *App) loadProgress(bookIdentity BookFileIdentity) (int64, bool, error) {
+func (a *App) loadProgress(bookIdentity book.FileIdentity) (int64, bool, error) {
 	file, err := os.ReadFile(a.cfg.SaveFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -256,24 +261,24 @@ func (a *App) loadProgress(bookIdentity BookFileIdentity) (int64, bool, error) {
 		return 0, false, fmt.Errorf("не вдалося прочитати файл прогресу %q: %w", a.cfg.SaveFile, err)
 	}
 
-	var p Progress
+	var p progress.Progress
 	if err := json.Unmarshal(file, &p); err != nil {
 		return 0, false, fmt.Errorf("файл прогресу має некоректний JSON: %w", err)
 	}
-	pos, err := validateProgressForBook(progressBook(a.cfg.BookFile, a.cfg.SaveFile, bookIdentity), p, bookIdentity.Size)
+	pos, err := progress.ValidateForBook(progress.BookForProgress(a.cfg.BookFile, a.cfg.SaveFile, bookIdentity), p, bookIdentity.Size)
 	if err != nil {
 		switch {
-		case errors.Is(err, ErrProgressBookMismatch):
+		case errors.Is(err, progress.ErrBookMismatch):
 			return 0, false, fmt.Errorf("файл прогресу належить іншій книзі")
-		case errors.Is(err, ErrPositionOutsideBook):
+		case errors.Is(err, progress.ErrPositionOutside):
 			return 0, false, fmt.Errorf("файл прогресу має позицію поза межами книги: %d", p.LastPosition)
-		case errors.Is(err, ErrProgressFormat):
+		case errors.Is(err, progress.ErrFormat):
 			return 0, false, fmt.Errorf("файл прогресу має непідтримуваний формат: %w", err)
 		default:
 			return 0, false, fmt.Errorf("файл прогресу несумісний з поточною книгою: %w", err)
 		}
 	}
-	isBoundary, err := isFileUTF8Boundary(a.cfg.BookFile, pos, bookIdentity.Size)
+	isBoundary, err := chunk.IsFileUTF8Boundary(a.cfg.BookFile, pos, bookIdentity.Size)
 	if err != nil {
 		return 0, false, fmt.Errorf("не вдалося перевірити UTF-8 межу прогресу: %w", err)
 	}
@@ -287,20 +292,20 @@ func (a *App) loadProgress(bookIdentity BookFileIdentity) (int64, bool, error) {
 }
 
 func (a *App) saveProgress(pos int64) error {
-	book := progressBook(a.cfg.BookFile, a.cfg.SaveFile, a.book)
-	if book.File.Fingerprint == "" {
-		identity, err := inspectBookFile(a.cfg.BookFile)
+	progressBook := progress.BookForProgress(a.cfg.BookFile, a.cfg.SaveFile, a.book)
+	if progressBook.File.Fingerprint == "" {
+		identity, err := book.InspectFile(a.cfg.BookFile)
 		if err != nil {
 			return fmt.Errorf("не вдалося отримати ідентичність книги для прогресу: %w", err)
 		}
-		book = progressBook(a.cfg.BookFile, a.cfg.SaveFile, identity)
+		progressBook = progress.BookForProgress(a.cfg.BookFile, a.cfg.SaveFile, identity)
 	}
 
-	data, err := json.Marshal(progressForBook(book, pos))
+	data, err := json.Marshal(progress.ProgressForBook(progressBook, pos))
 	if err != nil {
 		return fmt.Errorf("не вдалося серіалізувати прогрес: %w", err)
 	}
-	if err := writeFileReplace(a.cfg.SaveFile, data, 0644); err != nil {
+	if err := progress.WriteFileReplace(a.cfg.SaveFile, data, 0644); err != nil {
 		return fmt.Errorf("не вдалося записати файл %q: %w", a.cfg.SaveFile, err)
 	}
 	return nil
