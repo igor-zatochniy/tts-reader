@@ -25,6 +25,23 @@ func TestEventBrokerAssignsSequenceNumbers(t *testing.T) {
 	}
 }
 
+func TestEventBrokerQueuesInitialEventBeforePublishedEvents(t *testing.T) {
+	broker := newTestBroker()
+	events, unsubscribe := broker.SubscribeWithInitial(testEvent{Type: "playback.snapshot"})
+	defer unsubscribe()
+
+	broker.Publish(testEvent{Type: "playback.started"})
+
+	initial := receiveEvent(t, events)
+	if initial.Type != "playback.snapshot" || initial.Seq != 1 {
+		t.Fatalf("початкова подія має бути першою, отримано %#v", initial)
+	}
+	next := receiveEvent(t, events)
+	if next.Type != "playback.started" || next.Seq != 2 {
+		t.Fatalf("опублікована подія має йти після snapshot, отримано %#v", next)
+	}
+}
+
 func TestEventBrokerDropsLossyProgressForSlowClient(t *testing.T) {
 	broker := newTestBroker()
 	events, unsubscribe := broker.Subscribe()

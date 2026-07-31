@@ -120,11 +120,16 @@ func TestPlaybackManagerRejectsStartAfterBeginShutdown(t *testing.T) {
 	}
 }
 
-func TestPlaybackManagerRejectsStartThatWasLoadingDuringShutdown(t *testing.T) {
+func TestPlaybackManagerSerializesBeginShutdownAfterInFlightStart(t *testing.T) {
 	loadStarted := make(chan struct{}, 1)
 	releaseLoad := make(chan struct{})
 	manager := NewManagerWithProgress(
-		func(tts.Config) tts.Engine { return &testEngine{} },
+		func(tts.Config) tts.Engine {
+			return &testEngine{speakContext: func(ctx context.Context, text string) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}}
+		},
 		time.Second,
 		NewEventBroker(),
 		&blockingLoadProgressStore{
@@ -146,19 +151,51 @@ func TestPlaybackManagerRejectsStartThatWasLoadingDuringShutdown(t *testing.T) {
 		t.Fatal("Start не дійшов до завантаження прогресу")
 	}
 
-	manager.BeginShutdown()
+	shutdownDone := make(chan struct{})
+	go func() {
+		manager.BeginShutdown()
+		close(shutdownDone)
+	}()
+
+	select {
+	case <-shutdownDone:
+		t.Fatal("BeginShutdown не має обходити Start, який уже володіє controlMu")
+	case <-time.After(20 * time.Millisecond):
+	}
+
 	close(releaseLoad)
 
 	select {
 	case err := <-startErr:
-		if !errors.Is(err, ErrShuttingDown) {
-			t.Fatalf("очікував ErrShuttingDown, отримав %v", err)
+		if err != nil {
+			t.Fatalf("операція Start, що почалася першою, має завершитися: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start не завершився після shutdown")
 	}
-	if snapshot := manager.Snapshot(); snapshot.State != Stopped {
-		t.Fatalf("shutdown дозволив запустити playback: %#v", snapshot)
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("BeginShutdown не завершився після Start")
+	}
+
+	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID}); !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("нова операція після BeginShutdown має повертати ErrShuttingDown, отримано %v", err)
+	}
+	if _, err := manager.Stop(context.Background()); err != nil {
+		t.Fatalf("не вдалося зупинити in-flight playback: %v", err)
+	}
+}
+
+func TestPlaybackManagerSubscriptionStartsWithSnapshot(t *testing.T) {
+	manager := NewManager(func(tts.Config) tts.Engine { return &testEngine{} }, time.Second, NewEventBroker())
+	events, unsubscribe := manager.SubscribeEvents()
+	defer unsubscribe()
+
+	initial := receivePlaybackEvent(t, events)
+	if initial.Type != "playback.snapshot" || initial.Playback.State != Stopped || initial.Seq == 0 {
+		t.Fatalf("першою подією має бути актуальний snapshot: %#v", initial)
 	}
 }
 
@@ -408,7 +445,7 @@ func writeTempBook(t *testing.T, content string) string {
 
 func mustBook(t *testing.T, path string) book.Book {
 	t.Helper()
-	registered, err := book.NewStore().Add(book.AddRequest{Path: path})
+	registered, err := book.NewStoreWithProgressDir(filepath.Join(t.TempDir(), "progress")).Add(book.AddRequest{Path: path})
 	if err != nil {
 		t.Fatalf("не вдалося додати книгу: %v", err)
 	}
@@ -427,6 +464,20 @@ func waitState(t *testing.T, manager *PlaybackManager, want string) PlaybackSnap
 	}
 	t.Fatalf("стан playback не став %q, останній snapshot: %#v", want, manager.Snapshot())
 	return PlaybackSnapshot{}
+}
+
+func receivePlaybackEvent(t *testing.T, events <-chan PlaybackEvent) PlaybackEvent {
+	t.Helper()
+	select {
+	case event, ok := <-events:
+		if !ok {
+			t.Fatal("канал playback events закритий")
+		}
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("playback event не надійшов")
+		return PlaybackEvent{}
+	}
 }
 
 func assertSavedPosition(t *testing.T, path string, want int64) {

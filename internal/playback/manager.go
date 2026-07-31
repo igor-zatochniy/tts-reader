@@ -91,12 +91,11 @@ func NewEventBroker() *EventBroker {
 	}
 }
 
-func (b *EventBroker) Subscribe() (<-chan PlaybackEvent, func()) {
-	return b.broker.Subscribe()
-}
-
-func (b *EventBroker) NewEvent(eventType string, snapshot PlaybackSnapshot) PlaybackEvent {
-	return b.broker.NewEvent(PlaybackEvent{Type: eventType, Playback: snapshot})
+func (b *EventBroker) subscribeSnapshot(snapshot PlaybackSnapshot) (<-chan PlaybackEvent, func()) {
+	return b.broker.SubscribeWithInitial(PlaybackEvent{
+		Type:     "playback.snapshot",
+		Playback: snapshot,
+	})
 }
 
 func (b *EventBroker) Publish(event PlaybackEvent) {
@@ -488,16 +487,22 @@ func (m *PlaybackManager) Snapshot() PlaybackSnapshot {
 
 // BeginShutdown забороняє запуск нових операцій відтворення перед фінальним Stop.
 func (m *PlaybackManager) BeginShutdown() {
+	m.controlMu.Lock()
+	defer m.controlMu.Unlock()
 	m.shuttingDown.Store(true)
 }
 
-func (m *PlaybackManager) Events() *EventBroker {
-	return m.events
+// SubscribeEvents атомарно підписує клієнта та ставить актуальний snapshot першим у чергу.
+func (m *PlaybackManager) SubscribeEvents() (<-chan PlaybackEvent, func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.events.subscribeSnapshot(m.snapshotLocked())
 }
 
 func (m *PlaybackManager) play(session *playbackSession, book bookpkg.Book, startPos int64, chunkSize int) {
-	defer m.clearActiveSession(session.id)
+	// defer виконується у зворотному порядку: стан сесії очищається до сигналу done.
 	defer close(session.done)
+	defer m.clearActiveSession(session.id)
 
 	file, err := os.Open(book.Path)
 	if err != nil {

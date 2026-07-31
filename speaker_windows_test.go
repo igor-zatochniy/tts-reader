@@ -5,16 +5,19 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/igor-zatochniy/tts-reader/internal/chunk"
 )
 
 func TestSpeakWindowsCommandPassesTextThroughStdin(t *testing.T) {
 	t.Setenv("AUDIOBOOK_TTS_TEXT_B64", "stale-text")
 	t.Setenv("AUDIOBOOK_TTS_VOICE_B64", "stale-voice")
 
-	text := strings.Repeat("😀", maxChunkSize) + " Український текст"
+	text := strings.Repeat("😀", chunk.MaxSize) + " Український текст"
 	voice := "Microsoft Irina Desktop"
 
 	cmd := newSpeakWindowsCommand(context.Background(), text, voice)
@@ -53,5 +56,19 @@ func TestSpeakWindowsCommandPassesTextThroughStdin(t *testing.T) {
 	}
 	if !strings.Contains(script, "[Console]::In.ReadToEnd()") {
 		t.Fatalf("PowerShell script має читати текст зі stdin")
+	}
+}
+
+func TestPowerShellCommandErrorIncludesStderr(t *testing.T) {
+	err := errors.New("exit status 1")
+	got := powerShellCommandError("TTS command failed", err, "System.Speech failure")
+	if !errors.Is(got, err) || !strings.Contains(got.Error(), "System.Speech failure") {
+		t.Fatalf("PowerShell stderr втрачено: %v", got)
+	}
+}
+
+func TestWindowsSAPIVoiceDiscoverySmoke(t *testing.T) {
+	if _, err := listVoices(); err != nil {
+		t.Fatalf("Windows SAPI smoke test failed: %v", err)
 	}
 }

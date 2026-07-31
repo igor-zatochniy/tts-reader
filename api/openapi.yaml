@@ -56,7 +56,6 @@ paths:
       summary: Register a local text book
       security:
         - ApiTokenHeader: []
-        - ApiTokenQuery: []
       requestBody:
         required: true
         content:
@@ -100,7 +99,6 @@ paths:
       summary: Start audiobook playback
       security:
         - ApiTokenHeader: []
-        - ApiTokenQuery: []
       requestBody:
         required: true
         content:
@@ -148,7 +146,6 @@ paths:
       summary: Pause playback between chunks
       security:
         - ApiTokenHeader: []
-        - ApiTokenQuery: []
       responses:
         "200":
           description: Paused state
@@ -170,7 +167,6 @@ paths:
       summary: Resume paused playback
       security:
         - ApiTokenHeader: []
-        - ApiTokenQuery: []
       responses:
         "200":
           description: Playing state
@@ -192,7 +188,6 @@ paths:
       summary: Stop playback and persist the current byte position
       security:
         - ApiTokenHeader: []
-        - ApiTokenQuery: []
       responses:
         "200":
           description: Stopped state
@@ -224,7 +219,6 @@ paths:
       summary: Persist a new byte position for a registered book
       security:
         - ApiTokenHeader: []
-        - ApiTokenQuery: []
       requestBody:
         required: true
         content:
@@ -283,7 +277,7 @@ components:
       type: apiKey
       in: query
       name: token
-      description: Query token used by the built-in browser dashboard and SSE connections.
+      description: Query token used only by the built-in browser dashboard to open the SSE connection.
 
   responses:
     Error:

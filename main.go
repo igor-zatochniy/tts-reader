@@ -305,7 +305,7 @@ func (a *App) saveProgress(pos int64) error {
 	if err != nil {
 		return fmt.Errorf("не вдалося серіалізувати прогрес: %w", err)
 	}
-	if err := progress.WriteFileReplace(a.cfg.SaveFile, data, 0644); err != nil {
+	if err := progress.WriteFileReplace(a.cfg.SaveFile, data, 0600); err != nil {
 		return fmt.Errorf("не вдалося записати файл %q: %w", a.cfg.SaveFile, err)
 	}
 	return nil

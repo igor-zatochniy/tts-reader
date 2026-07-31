@@ -115,11 +115,19 @@ async function refreshState() {
 
 async function loadVoices() {
   const data = await api("/api/v1/voices");
-  $("voice").innerHTML = '<option value="">System default</option>' + data.voices.map((item) => {
+  const select = $("voice");
+  select.replaceChildren();
+  const systemDefault = document.createElement("option");
+  systemDefault.value = "";
+  systemDefault.textContent = "System default";
+  select.appendChild(systemDefault);
+  data.voices.forEach((item) => {
     const voice = item.name || item;
-    return '<option value="' + voice.replaceAll('"', "&quot;") + '">' + voice + "</option>";
-  }
-  ).join("");
+    const option = document.createElement("option");
+    option.value = voice;
+    option.textContent = voice;
+    select.appendChild(option);
+  });
 }
 
 $("addBook").onclick = async () => {

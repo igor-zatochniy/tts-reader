@@ -14,6 +14,7 @@
 - Розбиття тексту на фрагменти з урахуванням UTF-8, byte-offset прогресу і меж речень.
 - Збереження прогресу після кожного фрагмента, при TTS-помилці та при `Ctrl+C`.
 - Прив'язка progress-файлу до конкретної книги через version, book size і sampled SHA-256 fingerprint.
+- Зберігання progress за замовчуванням у user cache (`%LOCALAPPDATA%\tts-reader\progress` на Windows), а не поруч із книгою.
 - Валідація файлу прогресу, `-chunk`, `-tts-timeout` і UTF-8 меж перед відновленням читання.
 - Timeout для кожного TTS-фрагмента, щоб несправний Windows SAPI/audio stack не блокував CLI назавжди.
 - Регресійні тести для failure scenarios без запуску реального TTS.
@@ -142,8 +143,9 @@ Security model:
 
 - HTTP server приймає тільки loopback bind, наприклад `127.0.0.1:8080` або `localhost:8080`.
 - Middleware перевіряє `Host` і `Origin`, щоб стороння browser-сторінка не могла керувати локальним TTS service.
-- `POST`, `PUT`, `PATCH`, `DELETE` і `GET /api/v1/events` потребують token через `X-TTS-Token` або `?token=`.
+- `POST`, `PUT`, `PATCH` і `DELETE` потребують token виключно через `X-TTS-Token`; query token дозволений тільки для browser dashboard SSE-з'єднання `GET /api/v1/events`.
 - HTTP API не приймає `save_file` і не повертає абсолютні filesystem paths; progress-файл є внутрішньою деталлю застосунку.
+- Повторна реєстрація того самого канонічного book path повертає наявний `book_id` і оновлює файлові метадані без дублювання запису.
 - Книга стартує тільки якщо файл не змінився після реєстрації: перевіряються size, modification time і sampled SHA-256 fingerprint.
 - Progress відновлюється тільки якщо JSON належить цій самій книзі: перевіряються version, position unit, book size і book fingerprint.
 - Помилки API повертаються у структурованому форматі `{ "code": "...", "error": "..." }`; `Stop` повертає playback snapshot навіть якщо progress не вдалося зберегти.
@@ -153,7 +155,7 @@ Endpoints:
 
 | Method | Path | Опис |
 | --- | --- | --- |
-| `GET` | `/api/openapi.yaml` | OpenAPI 3.1 contract. |
+| `GET` | `/api/openapi.yaml` | OpenAPI 3.0.3 contract. |
 | `GET` | `/api/v1/voices` | Список доступних Windows SAPI голосів. |
 | `POST` | `/api/v1/books` | Додати локальну книгу за file path. |
 | `GET` | `/api/v1/books` | Список книг, зареєстрованих у поточному процесі. |
@@ -231,11 +233,13 @@ position.updated
 | Прапорець | За замовчуванням | Опис |
 | --- | --- | --- |
 | `-book` | `book.txt` | Шлях до текстового файлу книги. |
-| `-save` | `<book>.progress.json` | Шлях до JSON-файлу прогресу. |
+| `-save` | user cache | Шлях до JSON-файлу прогресу; за замовчуванням `%LOCALAPPDATA%\tts-reader\progress\<path-sha256>.json`. |
 | `-start` | empty | Фраза для старту, яка ігнорує збережений прогрес. |
 | `-voice` | empty | Точна назва голосу Windows SAPI. |
 | `-chunk` | `250` | Максимальний розмір фрагмента в символах. |
 | `-tts-timeout` | `2m0s` | Максимальний час очікування одного TTS-фрагмента. |
+
+Щоб продовжити читання зі старого progress-файлу, створеного поруч із книгою, передай його явно через `-save`.
 
 ## Перевірки
 
@@ -327,7 +331,7 @@ Release workflow у `.github/workflows/release.yml` запускається н�
 
 ## Файли користувача
 
-`book.txt`, `*.progress.json` і зібрані бінарні файли не мають потрапляти в репозиторій. Вони додані до `.gitignore`.
+`book.txt`, явно задані через `-save` файли `*.progress.json` і зібрані бінарні файли не мають потрапляти в репозиторій. Default progress зберігається поза робочим каталогом у user cache.
 
 ## Ліцензія
 

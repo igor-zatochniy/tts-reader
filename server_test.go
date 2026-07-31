@@ -14,13 +14,18 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	bookpkg "github.com/igor-zatochniy/tts-reader/internal/book"
+	apidto "github.com/igor-zatochniy/tts-reader/internal/httpapi"
+	playbackpkg "github.com/igor-zatochniy/tts-reader/internal/playback"
+	"github.com/igor-zatochniy/tts-reader/internal/tts"
 )
 
 func TestLocalAPIRegistersBooksAndListsVoices(t *testing.T) {
 	api := newTestLocalAPI(t, nil)
 	bookPath := writeTempBook(t, "Книга для API.")
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/books", AddBookRequest{
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/books", apidto.AddBookRequest{
 		Path:  bookPath,
 		Title: "API Book",
 	})
@@ -28,7 +33,7 @@ func TestLocalAPIRegistersBooksAndListsVoices(t *testing.T) {
 		t.Fatalf("очікував 201, отримав %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var book PublicBook
+	var book apidto.Book
 	decodeJSON(t, rec, &book)
 	if book.ID == "" || book.Title != "API Book" || book.Size == 0 {
 		t.Fatalf("некоректна відповідь книги: %#v", book)
@@ -39,7 +44,7 @@ func TestLocalAPIRegistersBooksAndListsVoices(t *testing.T) {
 		t.Fatalf("очікував 200, отримав %d: %s", rec.Code, rec.Body.String())
 	}
 	var list struct {
-		Books []PublicBook `json:"books"`
+		Books []apidto.Book `json:"books"`
 	}
 	decodeJSON(t, rec, &list)
 	if len(list.Books) != 1 || list.Books[0].ID != book.ID {
@@ -51,7 +56,7 @@ func TestLocalAPIRegistersBooksAndListsVoices(t *testing.T) {
 		t.Fatalf("очікував 200, отримав %d: %s", rec.Code, rec.Body.String())
 	}
 	var voices struct {
-		Voices []Voice `json:"voices"`
+		Voices []apidto.Voice `json:"voices"`
 	}
 	decodeJSON(t, rec, &voices)
 	if len(voices.Voices) != 2 || voices.Voices[0].Name != "Microsoft Irina Desktop" {
@@ -71,6 +76,9 @@ func TestLocalAPIServesDashboard(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `history.replaceState({}, document.title, "/")`) {
 		t.Fatalf("dashboard не прибирає token з адресного рядка")
+	}
+	if strings.Contains(rec.Body.String(), ".innerHTML") || !strings.Contains(rec.Body.String(), "option.textContent = voice") {
+		t.Fatalf("dashboard має створювати voice options через безпечний DOM API")
 	}
 
 	rec = performJSON(t, api.Routes(), http.MethodGet, "/api/openapi.yaml", nil)
@@ -143,11 +151,11 @@ func TestLocalAPIRejectsPlaybackStartDuringShutdown(t *testing.T) {
 
 	api.BeginShutdown()
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", apidto.StartPlaybackRequest{
 		BookID: registeredBook.ID,
 	})
 	assertErrorCode(t, rec, http.StatusServiceUnavailable, "service_shutting_down")
-	if snapshot := api.playback.Snapshot(); snapshot.State != playbackStopped {
+	if snapshot := api.playback.Snapshot(); snapshot.State != playbackpkg.Stopped {
 		t.Fatalf("shutdown request запустив playback: %#v", snapshot)
 	}
 }
@@ -164,7 +172,7 @@ func TestLocalAPIPlaybackFinishesAndSavesProgress(t *testing.T) {
 	bookPath := writeTempBook(t, "Перший. Другий.")
 	book := addTestBook(t, api, bookPath)
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", apidto.StartPlaybackRequest{
 		BookID:    book.ID,
 		Voice:     "Microsoft Irina Desktop",
 		ChunkSize: intPtr(8),
@@ -173,7 +181,7 @@ func TestLocalAPIPlaybackFinishesAndSavesProgress(t *testing.T) {
 		t.Fatalf("очікував 202, отримав %d: %s", rec.Code, rec.Body.String())
 	}
 
-	snapshot := waitForPlaybackState(t, api, playbackFinished)
+	snapshot := waitForPlaybackState(t, api, playbackpkg.Finished)
 	if snapshot.ProgressPercent != 100 {
 		t.Fatalf("очікував 100%% прогресу, отримав %.2f", snapshot.ProgressPercent)
 	}
@@ -199,7 +207,7 @@ func TestLocalAPIPauseResumeAndStop(t *testing.T) {
 	})
 	book := addTestBook(t, api, writeTempBook(t, "Перший. Другий."))
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", apidto.StartPlaybackRequest{
 		BookID:    book.ID,
 		ChunkSize: intPtr(8),
 	})
@@ -218,14 +226,14 @@ func TestLocalAPIPauseResumeAndStop(t *testing.T) {
 		t.Fatalf("очікував 200 pause, отримав %d: %s", rec.Code, rec.Body.String())
 	}
 	close(release)
-	waitForPlaybackState(t, api, playbackPaused)
+	waitForPlaybackState(t, api, playbackpkg.Paused)
 
 	rec = performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback/resume", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("очікував 200 resume, отримав %d: %s", rec.Code, rec.Body.String())
 	}
 
-	waitForPlaybackState(t, api, playbackFinished)
+	waitForPlaybackState(t, api, playbackpkg.Finished)
 	rec = performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback/stop", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("очікував 200 stop, отримав %d: %s", rec.Code, rec.Body.String())
@@ -236,7 +244,7 @@ func TestPlaybackStopWaitsForEngineToStop(t *testing.T) {
 	started := make(chan struct{}, 1)
 	stopCalled := make(chan struct{}, 1)
 	release := make(chan struct{})
-	api := newTestLocalAPIWithEngineFactory(func(cfg Config) TTSEngine {
+	api := newTestLocalAPIWithEngineFactory(t, func(cfg tts.Config) tts.Engine {
 		return &testEngine{
 			speakContext: func(ctx context.Context, text string) error {
 				select {
@@ -263,7 +271,7 @@ func TestPlaybackStopWaitsForEngineToStop(t *testing.T) {
 	})
 	book := addTestBook(t, api, writeTempBook(t, "Зупинка має чекати engine."))
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", apidto.StartPlaybackRequest{
 		BookID:    book.ID,
 		ChunkSize: intPtr(128),
 	})
@@ -285,7 +293,7 @@ func TestPlaybackStopWaitsForEngineToStop(t *testing.T) {
 	default:
 		t.Fatal("Stop не викликав engine.Stop")
 	}
-	if snapshot := api.playback.Snapshot(); snapshot.State != playbackStopped {
+	if snapshot := api.playback.Snapshot(); snapshot.State != playbackpkg.Stopped {
 		t.Fatalf("очікував stopped після Stop, отримав %#v", snapshot)
 	}
 }
@@ -293,8 +301,8 @@ func TestPlaybackStopWaitsForEngineToStop(t *testing.T) {
 func TestPlaybackStopTimeoutLeavesSessionStopping(t *testing.T) {
 	started := make(chan struct{}, 1)
 	releaseSpeak := make(chan struct{})
-	manager := NewPlaybackManager(
-		func(cfg Config) TTSEngine {
+	manager := playbackpkg.NewManager(
+		func(cfg tts.Config) tts.Engine {
 			return &testEngine{
 				speakContext: func(ctx context.Context, text string) error {
 					select {
@@ -311,11 +319,11 @@ func TestPlaybackStopTimeoutLeavesSessionStopping(t *testing.T) {
 			}
 		},
 		time.Second,
-		NewEventBroker(),
+		playbackpkg.NewEventBroker(),
 	)
 	book := mustAddBook(t, writeTempBook(t, "Повільне завершення."))
 
-	_, err := manager.Start(book, StartPlaybackRequest{
+	_, err := manager.Start(book, playbackpkg.StartRequest{
 		BookID:    book.ID,
 		ChunkSize: intPtr(128),
 	})
@@ -331,42 +339,42 @@ func TestPlaybackStopTimeoutLeavesSessionStopping(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	snapshot, err := manager.Stop(ctx)
-	if !errors.Is(err, ErrPlaybackStopping) || !errors.Is(err, context.DeadlineExceeded) {
+	if !errors.Is(err, playbackpkg.ErrStopping) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("очікував ErrPlaybackStopping і deadline, отримав snapshot=%#v err=%v", snapshot, err)
 	}
-	if snapshot.State != playbackStopping {
+	if snapshot.State != playbackpkg.Stopping {
 		t.Fatalf("очікував стан stopping після timeout, отримав %#v", snapshot)
 	}
 	if snapshot.ErrorCode != "playback_stopping" {
 		t.Fatalf("domain snapshot має містити лише playback_stopping code: %#v", snapshot)
 	}
 
-	_, err = manager.Start(book, StartPlaybackRequest{
+	_, err = manager.Start(book, playbackpkg.StartRequest{
 		BookID:    book.ID,
 		ChunkSize: intPtr(128),
 	})
-	if !errors.Is(err, ErrPlaybackStopping) {
+	if !errors.Is(err, playbackpkg.ErrStopping) {
 		t.Fatalf("очікував ErrPlaybackStopping для нового Start, отримав %v", err)
 	}
 
 	close(releaseSpeak)
-	if snapshot := waitForManagerState(t, manager, playbackStopped); snapshot.State != playbackStopped {
+	if snapshot := waitForManagerState(t, manager, playbackpkg.Stopped); snapshot.State != playbackpkg.Stopped {
 		t.Fatalf("після завершення goroutine очікував stopped, отримав %#v", snapshot)
 	}
-	if _, err := manager.Start(book, StartPlaybackRequest{
+	if _, err := manager.Start(book, playbackpkg.StartRequest{
 		BookID:    book.ID,
 		ChunkSize: intPtr(128),
 	}); err != nil {
 		t.Fatalf("після завершення stopping очікував новий Start без помилки, отримав %v", err)
 	}
-	waitForManagerState(t, manager, playbackFinished)
+	waitForManagerState(t, manager, playbackpkg.Finished)
 }
 
 func TestConcurrentStartAndSetPosition(t *testing.T) {
 	book := mustAddBook(t, writeTempBook(t, "Перший. Другий."))
 
 	for i := 0; i < 100; i++ {
-		engines := func(cfg Config) TTSEngine {
+		engines := func(cfg tts.Config) tts.Engine {
 			return &testEngine{
 				speakContext: func(ctx context.Context, text string) error {
 					<-ctx.Done()
@@ -374,13 +382,13 @@ func TestConcurrentStartAndSetPosition(t *testing.T) {
 				},
 			}
 		}
-		manager := NewPlaybackManager(engines, time.Second, NewEventBroker())
+		manager := playbackpkg.NewManager(engines, time.Second, playbackpkg.NewEventBroker())
 
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, _ = manager.Start(book, StartPlaybackRequest{
+			_, _ = manager.Start(book, playbackpkg.StartRequest{
 				BookID:    book.ID,
 				ChunkSize: intPtr(64),
 			})
@@ -399,7 +407,7 @@ func TestConcurrentStartAndSetPosition(t *testing.T) {
 func TestStopReturnsProgressSaveError(t *testing.T) {
 	saveErr := errors.New("disk full")
 	started := make(chan struct{}, 1)
-	engines := func(cfg Config) TTSEngine {
+	engines := func(cfg tts.Config) tts.Engine {
 		return &testEngine{
 			speakContext: func(ctx context.Context, text string) error {
 				select {
@@ -411,10 +419,10 @@ func TestStopReturnsProgressSaveError(t *testing.T) {
 			},
 		}
 	}
-	manager := NewPlaybackManagerWithProgress(engines, time.Second, NewEventBroker(), &failingProgressStore{saveErr: saveErr})
+	manager := playbackpkg.NewManagerWithProgress(engines, time.Second, playbackpkg.NewEventBroker(), &failingProgressStore{saveErr: saveErr})
 	book := mustAddBook(t, writeTempBook(t, "Збереження падає."))
 
-	_, err := manager.Start(book, StartPlaybackRequest{BookID: book.ID, ChunkSize: intPtr(128)})
+	_, err := manager.Start(book, playbackpkg.StartRequest{BookID: book.ID, ChunkSize: intPtr(128)})
 	if err != nil {
 		t.Fatalf("не очікував помилку Start: %v", err)
 	}
@@ -428,7 +436,7 @@ func TestStopReturnsProgressSaveError(t *testing.T) {
 	if !errors.Is(err, saveErr) {
 		t.Fatalf("очікував saveErr, отримав %v", err)
 	}
-	if snapshot.State != playbackStopped || snapshot.ErrorCode != "internal_error" {
+	if snapshot.State != playbackpkg.Stopped || snapshot.ErrorCode != "internal_error" {
 		t.Fatalf("очікував stopped domain snapshot з error_code, отримав %#v", snapshot)
 	}
 }
@@ -436,7 +444,7 @@ func TestStopReturnsProgressSaveError(t *testing.T) {
 func TestStopReturnsEngineStopError(t *testing.T) {
 	stopErr := errors.New("engine stop failed")
 	started := make(chan struct{}, 1)
-	engines := func(cfg Config) TTSEngine {
+	engines := func(cfg tts.Config) tts.Engine {
 		return &testEngine{
 			speakContext: func(ctx context.Context, text string) error {
 				select {
@@ -451,10 +459,10 @@ func TestStopReturnsEngineStopError(t *testing.T) {
 			},
 		}
 	}
-	manager := NewPlaybackManagerWithProgress(engines, time.Second, NewEventBroker(), &failingProgressStore{})
+	manager := playbackpkg.NewManagerWithProgress(engines, time.Second, playbackpkg.NewEventBroker(), &failingProgressStore{})
 	book := mustAddBook(t, writeTempBook(t, "Engine stop падає."))
 
-	_, err := manager.Start(book, StartPlaybackRequest{BookID: book.ID, ChunkSize: intPtr(128)})
+	_, err := manager.Start(book, playbackpkg.StartRequest{BookID: book.ID, ChunkSize: intPtr(128)})
 	if err != nil {
 		t.Fatalf("не очікував помилку Start: %v", err)
 	}
@@ -472,20 +480,20 @@ func TestStopReturnsEngineStopError(t *testing.T) {
 
 func TestFinishFailsWhenProgressResetFails(t *testing.T) {
 	resetErr := errors.New("reset denied")
-	manager := NewPlaybackManagerWithProgress(
-		func(cfg Config) TTSEngine { return &testEngine{} },
+	manager := playbackpkg.NewManagerWithProgress(
+		func(cfg tts.Config) tts.Engine { return &testEngine{} },
 		time.Second,
-		NewEventBroker(),
+		playbackpkg.NewEventBroker(),
 		&failingProgressStore{resetErr: resetErr},
 	)
 	book := mustAddBook(t, writeTempBook(t, "Кінець."))
 
-	_, err := manager.Start(book, StartPlaybackRequest{BookID: book.ID, ChunkSize: intPtr(128)})
+	_, err := manager.Start(book, playbackpkg.StartRequest{BookID: book.ID, ChunkSize: intPtr(128)})
 	if err != nil {
 		t.Fatalf("не очікував помилку Start: %v", err)
 	}
 
-	snapshot := waitForManagerState(t, manager, playbackFailed)
+	snapshot := waitForManagerState(t, manager, playbackpkg.Failed)
 	if snapshot.ErrorCode != "internal_error" {
 		t.Fatalf("domain snapshot має містити лише error_code: %#v", snapshot)
 	}
@@ -494,8 +502,8 @@ func TestFinishFailsWhenProgressResetFails(t *testing.T) {
 func TestPlaybackFailureSanitizesInternalErrors(t *testing.T) {
 	playbackErr := errors.New("tts failed")
 	saveErr := errors.New("save failed")
-	manager := NewPlaybackManagerWithProgress(
-		func(cfg Config) TTSEngine {
+	manager := playbackpkg.NewManagerWithProgress(
+		func(cfg tts.Config) tts.Engine {
 			return &testEngine{
 				speakContext: func(ctx context.Context, text string) error {
 					return playbackErr
@@ -503,17 +511,17 @@ func TestPlaybackFailureSanitizesInternalErrors(t *testing.T) {
 			}
 		},
 		time.Second,
-		NewEventBroker(),
+		playbackpkg.NewEventBroker(),
 		&failingProgressStore{saveErr: saveErr},
 	)
 	book := mustAddBook(t, writeTempBook(t, "Помилка."))
 
-	_, err := manager.Start(book, StartPlaybackRequest{BookID: book.ID, ChunkSize: intPtr(128)})
+	_, err := manager.Start(book, playbackpkg.StartRequest{BookID: book.ID, ChunkSize: intPtr(128)})
 	if err != nil {
 		t.Fatalf("не очікував помилку Start: %v", err)
 	}
 
-	snapshot := waitForManagerState(t, manager, playbackFailed)
+	snapshot := waitForManagerState(t, manager, playbackpkg.Failed)
 	if snapshot.ErrorCode != "internal_error" ||
 		strings.Contains(snapshot.ErrorCode, playbackErr.Error()) ||
 		strings.Contains(snapshot.ErrorCode, saveErr.Error()) {
@@ -522,8 +530,8 @@ func TestPlaybackFailureSanitizesInternalErrors(t *testing.T) {
 }
 
 func TestPublicPlaybackSnapshotMapsErrorCodeToMessage(t *testing.T) {
-	snapshot := publicPlaybackSnapshot(PlaybackSnapshot{
-		State:     playbackFailed,
+	snapshot := publicPlaybackSnapshot(playbackpkg.PlaybackSnapshot{
+		State:     playbackpkg.Failed,
 		ErrorCode: "internal_error",
 	})
 	if snapshot.Error != "internal server error" || snapshot.ErrorCode != "internal_error" {
@@ -533,20 +541,20 @@ func TestPublicPlaybackSnapshotMapsErrorCodeToMessage(t *testing.T) {
 
 func TestLocalAPISanitizesInternalErrors(t *testing.T) {
 	internalErr := errors.New(`C:\secret\book_save.json denied`)
-	engines := func(cfg Config) TTSEngine { return &testEngine{} }
+	engines := func(cfg tts.Config) tts.Engine { return &testEngine{} }
 	api := NewLocalAPI(
-		NewBookStore(),
-		NewPlaybackManagerWithProgress(engines, time.Second, NewEventBroker(), &failingProgressStore{loadErr: internalErr}),
+		bookpkg.NewStoreWithProgressDir(t.TempDir()),
+		playbackpkg.NewManagerWithProgress(engines, time.Second, playbackpkg.NewEventBroker(), &failingProgressStore{loadErr: internalErr}),
 		engines,
 		"test-token",
 	)
 	book := addTestBook(t, api, writeTempBook(t, "Книга."))
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{BookID: book.ID})
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", apidto.StartPlaybackRequest{BookID: book.ID})
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("очікував 500, отримав %d: %s", rec.Code, rec.Body.String())
 	}
-	var got ErrorResponse
+	var got apidto.ErrorResponse
 	decodeJSON(t, rec, &got)
 	if got.Code != "internal_error" || got.Error != "internal server error" {
 		t.Fatalf("очікував безпечну помилку, отримав %#v", got)
@@ -560,7 +568,7 @@ func TestLocalAPIRejectsInvalidPositionInsideUTF8Rune(t *testing.T) {
 	api := newTestLocalAPI(t, nil)
 	book := addTestBook(t, api, writeTempBook(t, "Аудіо"))
 
-	rec := performJSON(t, api.Routes(), http.MethodPut, "/api/v1/playback/position", SetPositionRequest{
+	rec := performJSON(t, api.Routes(), http.MethodPut, "/api/v1/playback/position", apidto.SetPositionRequest{
 		BookID:      book.ID,
 		CurrentByte: int64Ptr(1),
 	})
@@ -581,7 +589,7 @@ func TestLocalAPISecurityRejectsBadHostOriginAndMissingToken(t *testing.T) {
 	api := newTestLocalAPI(t, nil)
 	bookPath := writeTempBook(t, "Книга.")
 
-	rec := performJSONWithoutToken(t, api.Routes(), http.MethodPost, "/api/v1/books", AddBookRequest{Path: bookPath})
+	rec := performJSONWithoutToken(t, api.Routes(), http.MethodPost, "/api/v1/books", apidto.AddBookRequest{Path: bookPath})
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("очікував 401 без token, отримав %d: %s", rec.Code, rec.Body.String())
 	}
@@ -606,11 +614,24 @@ func TestLocalAPISecurityRejectsBadHostOriginAndMissingToken(t *testing.T) {
 	}
 }
 
+func TestLocalAPIRejectsQueryTokenForMutation(t *testing.T) {
+	api := newTestLocalAPI(t, nil)
+	bookPath := writeTempBook(t, "Книга.")
+	rec := performRawJSONWithoutHeader(
+		t,
+		api.Routes(),
+		http.MethodPost,
+		"/api/v1/books?token=test-token",
+		`{"path":"`+strings.ReplaceAll(bookPath, `\`, `\\`)+`"}`,
+	)
+	assertErrorCode(t, rec, http.StatusUnauthorized, "api_token_required")
+}
+
 func TestLocalAPIDoesNotExposeInternalBookPaths(t *testing.T) {
 	api := newTestLocalAPI(t, nil)
 	bookPath := writeTempBook(t, "Книга.")
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/books", AddBookRequest{Path: bookPath})
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/books", apidto.AddBookRequest{Path: bookPath})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("очікував 201, отримав %d: %s", rec.Code, rec.Body.String())
 	}
@@ -628,7 +649,7 @@ func TestStartRejectsExtendedBook(t *testing.T) {
 		t.Fatalf("не вдалося змінити книгу: %v", err)
 	}
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{BookID: book.ID})
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", apidto.StartPlaybackRequest{BookID: book.ID})
 	assertErrorCode(t, rec, http.StatusConflict, "book_modified")
 }
 
@@ -640,7 +661,7 @@ func TestStartRejectsTruncatedBook(t *testing.T) {
 		t.Fatalf("не вдалося змінити книгу: %v", err)
 	}
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{BookID: book.ID})
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", apidto.StartPlaybackRequest{BookID: book.ID})
 	assertErrorCode(t, rec, http.StatusConflict, "book_modified")
 }
 
@@ -655,7 +676,7 @@ func TestStartRejectsBookWithSameSizeButChangedContent(t *testing.T) {
 		t.Fatalf("не вдалося повернути mtime книги: %v", err)
 	}
 
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", StartPlaybackRequest{BookID: book.ID})
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/playback", apidto.StartPlaybackRequest{BookID: book.ID})
 	assertErrorCode(t, rec, http.StatusConflict, "book_modified")
 }
 
@@ -666,9 +687,9 @@ func TestSetPositionRejectsTruncatedBook(t *testing.T) {
 		t.Fatalf("не вдалося скоротити книгу: %v", err)
 	}
 
-	manager := NewPlaybackManager(func(cfg Config) TTSEngine { return &testEngine{} }, time.Second, NewEventBroker())
+	manager := playbackpkg.NewManager(func(cfg tts.Config) tts.Engine { return &testEngine{} }, time.Second, playbackpkg.NewEventBroker())
 	_, err := manager.SetPosition(book, 6)
-	if !errors.Is(err, ErrBookModified) {
+	if !errors.Is(err, bookpkg.ErrModified) {
 		t.Fatalf("очікував ErrBookModified, отримав %v", err)
 	}
 }
@@ -680,9 +701,9 @@ func TestSetPositionRejectsExtendedBook(t *testing.T) {
 		t.Fatalf("не вдалося розширити книгу: %v", err)
 	}
 
-	manager := NewPlaybackManager(func(cfg Config) TTSEngine { return &testEngine{} }, time.Second, NewEventBroker())
+	manager := playbackpkg.NewManager(func(cfg tts.Config) tts.Engine { return &testEngine{} }, time.Second, playbackpkg.NewEventBroker())
 	_, err := manager.SetPosition(book, 3)
-	if !errors.Is(err, ErrBookModified) {
+	if !errors.Is(err, bookpkg.ErrModified) {
 		t.Fatalf("очікував ErrBookModified, отримав %v", err)
 	}
 }
@@ -697,16 +718,16 @@ func TestSetPositionRejectsSameSizeModifiedBook(t *testing.T) {
 		t.Fatalf("не вдалося повернути mtime книги: %v", err)
 	}
 
-	manager := NewPlaybackManager(func(cfg Config) TTSEngine { return &testEngine{} }, time.Second, NewEventBroker())
+	manager := playbackpkg.NewManager(func(cfg tts.Config) tts.Engine { return &testEngine{} }, time.Second, playbackpkg.NewEventBroker())
 	_, err := manager.SetPosition(book, 3)
-	if !errors.Is(err, ErrBookModified) {
+	if !errors.Is(err, bookpkg.ErrModified) {
 		t.Fatalf("очікував ErrBookModified, отримав %v", err)
 	}
 }
 
 func TestBookStoreRejectsDirectory(t *testing.T) {
 	api := newTestLocalAPI(t, nil)
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/books", AddBookRequest{Path: t.TempDir()})
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/books", apidto.AddBookRequest{Path: t.TempDir()})
 	assertErrorCode(t, rec, http.StatusBadRequest, "book_not_regular")
 }
 
@@ -749,7 +770,7 @@ func newTestLocalAPI(t *testing.T, speak func(text string) error) *LocalAPI {
 	if speak == nil {
 		speak = func(text string) error { return nil }
 	}
-	return newTestLocalAPIWithEngineFactory(func(cfg Config) TTSEngine {
+	return newTestLocalAPIWithEngineFactory(t, func(cfg tts.Config) tts.Engine {
 		return &testEngine{
 			speakContext: func(ctx context.Context, text string) error {
 				return speak(text)
@@ -758,9 +779,15 @@ func newTestLocalAPI(t *testing.T, speak func(text string) error) *LocalAPI {
 	})
 }
 
-func newTestLocalAPIWithEngineFactory(engines engineFactory) *LocalAPI {
-	events := NewEventBroker()
-	return NewLocalAPI(NewBookStore(), NewPlaybackManager(engines, time.Second, events), engines, "test-token")
+func newTestLocalAPIWithEngineFactory(t *testing.T, engines tts.EngineFactory) *LocalAPI {
+	t.Helper()
+	events := playbackpkg.NewEventBroker()
+	return NewLocalAPI(
+		bookpkg.NewStoreWithProgressDir(filepath.Join(t.TempDir(), "progress")),
+		playbackpkg.NewManager(engines, time.Second, events),
+		engines,
+		"test-token",
+	)
 }
 
 type testEngine struct {
@@ -775,8 +802,8 @@ func (e *testEngine) Speak(ctx context.Context, text string) error {
 	return e.speakContext(ctx, text)
 }
 
-func (e *testEngine) Voices(ctx context.Context) ([]Voice, error) {
-	return []Voice{{Name: "Microsoft Irina Desktop"}, {Name: "Microsoft David Desktop"}}, nil
+func (e *testEngine) Voices(ctx context.Context) ([]tts.Voice, error) {
+	return []tts.Voice{{Name: "Microsoft Irina Desktop"}, {Name: "Microsoft David Desktop"}}, nil
 }
 
 func (e *testEngine) Stop(ctx context.Context) error {
@@ -795,22 +822,22 @@ func writeTempBook(t *testing.T, content string) string {
 	return path
 }
 
-func mustAddBook(t *testing.T, path string) Book {
+func mustAddBook(t *testing.T, path string) bookpkg.Book {
 	t.Helper()
-	book, err := NewBookStore().Add(AddBookRequest{Path: path})
+	book, err := bookpkg.NewStoreWithProgressDir(filepath.Join(t.TempDir(), "progress")).Add(bookpkg.AddRequest{Path: path})
 	if err != nil {
 		t.Fatalf("не вдалося додати книгу: %v", err)
 	}
 	return book
 }
 
-func addTestBook(t *testing.T, api *LocalAPI, path string) Book {
+func addTestBook(t *testing.T, api *LocalAPI, path string) bookpkg.Book {
 	t.Helper()
-	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/books", AddBookRequest{Path: path})
+	rec := performJSON(t, api.Routes(), http.MethodPost, "/api/v1/books", apidto.AddBookRequest{Path: path})
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("очікував 201, отримав %d: %s", rec.Code, rec.Body.String())
 	}
-	var public PublicBook
+	var public apidto.Book
 	decodeJSON(t, rec, &public)
 	book, ok := api.store.Get(public.ID)
 	if !ok {
@@ -825,18 +852,18 @@ type failingProgressStore struct {
 	resetErr error
 }
 
-func (s *failingProgressStore) Load(book Book, currentSize int64) (int64, error) {
+func (s *failingProgressStore) Load(book bookpkg.Book, currentSize int64) (int64, error) {
 	if s.loadErr != nil {
 		return 0, s.loadErr
 	}
 	return 0, nil
 }
 
-func (s *failingProgressStore) Save(book Book, position int64) error {
+func (s *failingProgressStore) Save(book bookpkg.Book, position int64) error {
 	return s.saveErr
 }
 
-func (s *failingProgressStore) Reset(book Book) error {
+func (s *failingProgressStore) Reset(book bookpkg.Book) error {
 	return s.resetErr
 }
 
@@ -864,6 +891,16 @@ func performRawJSON(t *testing.T, handler http.Handler, method string, path stri
 	req := httptest.NewRequest(method, path, strings.NewReader(payload))
 	req.Host = defaultServeAddr
 	req.Header.Set("X-TTS-Token", "test-token")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func performRawJSONWithoutHeader(t *testing.T, handler http.Handler, method string, path string, payload string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(payload))
+	req.Host = defaultServeAddr
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -900,14 +937,14 @@ func assertErrorCode(t *testing.T, rec *httptest.ResponseRecorder, wantStatus in
 	if rec.Code != wantStatus {
 		t.Fatalf("очікував HTTP %d, отримав %d: %s", wantStatus, rec.Code, rec.Body.String())
 	}
-	var got ErrorResponse
+	var got apidto.ErrorResponse
 	decodeJSON(t, rec, &got)
 	if got.Code != wantCode {
 		t.Fatalf("очікував code %q, отримав %#v", wantCode, got)
 	}
 }
 
-func waitForPlaybackState(t *testing.T, api *LocalAPI, want string) PlaybackSnapshot {
+func waitForPlaybackState(t *testing.T, api *LocalAPI, want string) playbackpkg.PlaybackSnapshot {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -918,10 +955,10 @@ func waitForPlaybackState(t *testing.T, api *LocalAPI, want string) PlaybackSnap
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("стан playback не став %q, останній snapshot: %#v", want, api.playback.Snapshot())
-	return PlaybackSnapshot{}
+	return playbackpkg.PlaybackSnapshot{}
 }
 
-func waitForManagerState(t *testing.T, manager *PlaybackManager, want string) PlaybackSnapshot {
+func waitForManagerState(t *testing.T, manager *playbackpkg.PlaybackManager, want string) playbackpkg.PlaybackSnapshot {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -932,7 +969,7 @@ func waitForManagerState(t *testing.T, manager *PlaybackManager, want string) Pl
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("стан playback не став %q, останній snapshot: %#v", want, manager.Snapshot())
-	return PlaybackSnapshot{}
+	return playbackpkg.PlaybackSnapshot{}
 }
 
 func intPtr(v int) *int {

@@ -96,7 +96,8 @@ Root package лишається application layer:
 
 ## Як закриваються SSE-клієнти
 
-- SSE клієнт підписується через `EventBroker.Subscribe()`.
+- SSE клієнт підписується через `PlaybackManager.SubscribeEvents()`.
+- Реєстрація клієнта та постановка початкового `playback.snapshot` у його чергу виконуються атомарно; live event не може випередити initial snapshot.
 - Підписка повертає канал подій і `unsubscribe`.
 - На виході з handler підписка завжди закривається через `defer unsubscribe()`.
 - Для коректного завершення сервера `BaseContext` від `http.Server` скасовується через `cancelServe()`, тому відкриті SSE-запити виходять без зависання shutdown.
@@ -119,7 +120,7 @@ Root package лишається application layer:
 
 Реалізація зберігання локальна:
 
-- `ProgressStore.Save(...)` пише JSON-файл поруч із книгою;
+- `ProgressStore.Save(...)` пише JSON у user cache (`%LOCALAPPDATA%\tts-reader\progress` на Windows) за SHA-256 канонічного book path;
 - атомарна заміна файла використовується, щоб не отримати напівзаписаний progress;
 - `Load(...)` перевіряє version, UTF-8 межі, розмір поточного файла і fingerprint книги, щоб progress не можна було випадково застосувати до іншого тексту.
 

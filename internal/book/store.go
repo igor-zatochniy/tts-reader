@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -43,13 +44,27 @@ type AddRequest struct {
 }
 
 type BookStore struct {
-	mu    sync.RWMutex
-	next  int64
-	books map[string]Book
+	mu          sync.RWMutex
+	next        int64
+	books       map[string]Book
+	byPath      map[string]string
+	progressDir string
 }
 
 func NewStore() *BookStore {
-	return &BookStore{books: make(map[string]Book)}
+	return NewStoreWithProgressDir(defaultProgressDir())
+}
+
+// NewStoreWithProgressDir створює store з окремим каталогом progress-файлів.
+func NewStoreWithProgressDir(progressDir string) *BookStore {
+	if strings.TrimSpace(progressDir) == "" {
+		progressDir = defaultProgressDir()
+	}
+	return &BookStore{
+		books:       make(map[string]Book),
+		byPath:      make(map[string]string),
+		progressDir: progressDir,
+	}
 }
 
 func (s *BookStore) Add(req AddRequest) (Book, error) {
@@ -57,7 +72,7 @@ func (s *BookStore) Add(req AddRequest) (Book, error) {
 		return Book{}, ErrPathRequired
 	}
 
-	absPath, err := filepath.Abs(req.Path)
+	absPath, pathKey, err := canonicalBookPath(req.Path)
 	if err != nil {
 		return Book{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
@@ -73,17 +88,29 @@ func (s *BookStore) Add(req AddRequest) (Book, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if id, ok := s.byPath[pathKey]; ok {
+		existing := s.books[id]
+		existing.Size = identity.Size
+		existing.File = identity
+		if strings.TrimSpace(req.Title) != "" {
+			existing.Title = title
+		}
+		s.books[id] = existing
+		return existing, nil
+	}
+
 	s.next++
 	book := Book{
 		ID:        fmt.Sprintf("book-%d", s.next),
 		Title:     title,
 		Path:      absPath,
-		SaveFile:  DefaultProgressPath(absPath),
+		SaveFile:  progressPathInDir(s.progressDir, absPath),
 		Size:      identity.Size,
 		File:      identity,
 		CreatedAt: time.Now().UTC(),
 	}
 	s.books[book.ID] = book
+	s.byPath[pathKey] = book.ID
 	return book, nil
 }
 
@@ -106,7 +133,40 @@ func (s *BookStore) Get(id string) (Book, bool) {
 }
 
 func DefaultProgressPath(bookPath string) string {
-	return bookPath + ".progress.json"
+	return progressPathInDir(defaultProgressDir(), bookPath)
+}
+
+func defaultProgressDir() string {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheDir) == "" {
+		cacheDir = os.TempDir()
+	}
+	return filepath.Join(cacheDir, "tts-reader", "progress")
+}
+
+func progressPathInDir(dir string, bookPath string) string {
+	_, key, err := canonicalBookPath(bookPath)
+	if err != nil {
+		key = filepath.Clean(bookPath)
+	}
+	sum := sha256.Sum256([]byte(key))
+	return filepath.Join(dir, hex.EncodeToString(sum[:])+".json")
+}
+
+func canonicalBookPath(path string) (string, string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	absPath = filepath.Clean(absPath)
+	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
+		absPath = filepath.Clean(resolved)
+	}
+	key := absPath
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	return absPath, key, nil
 }
 
 func InspectFile(path string) (FileIdentity, error) {

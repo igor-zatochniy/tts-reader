@@ -66,7 +66,7 @@ func (api *LocalAPI) authorized(r *http.Request) bool {
 		return true
 	}
 	token := r.Header.Get("X-TTS-Token")
-	if token == "" {
+	if token == "" && r.Method == http.MethodGet && r.URL.Path == "/api/v1/events" {
 		token = r.URL.Query().Get("token")
 	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(api.token)) == 1
@@ -276,7 +276,7 @@ func (api *LocalAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, unsubscribe := api.playback.Events().Subscribe()
+	events, unsubscribe := api.playback.SubscribeEvents()
 	defer unsubscribe()
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -287,11 +287,6 @@ func (api *LocalAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if _, err := fmt.Fprint(w, "retry: 1000\n"); err != nil {
 		return
 	}
-	if err := writeSSEPlaybackEvent(w, api.playback.Events().NewEvent("playback.snapshot", api.playback.Snapshot())); err != nil {
-		return
-	}
-	flusher.Flush()
-
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 

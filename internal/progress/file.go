@@ -11,6 +11,9 @@ func WriteFileReplace(path string, data []byte, perm os.FileMode) error {
 
 func WriteFileReplaceWith(path string, data []byte, perm os.FileMode, replace func(string, string) error) error {
 	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
 	base := filepath.Base(path)
 	tmp, err := os.CreateTemp(dir, "."+base+".tmp-*")
 	if err != nil {

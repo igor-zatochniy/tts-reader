@@ -28,8 +28,26 @@ func NewBroker[T any](options Options[T]) *Broker[T] {
 }
 
 func (b *Broker[T]) Subscribe() (<-chan T, func()) {
+	return b.subscribe(nil)
+}
+
+// SubscribeWithInitial додає клієнта та початкову подію під одним блокуванням.
+func (b *Broker[T]) SubscribeWithInitial(initial T) (<-chan T, func()) {
+	return b.subscribe(&initial)
+}
+
+func (b *Broker[T]) subscribe(initial *T) (<-chan T, func()) {
 	ch := make(chan T, eventBufferSize)
 	b.mu.Lock()
+	if initial != nil {
+		event := *initial
+		if b.options.Sequence != nil && b.options.Sequence(event) == 0 {
+			event = b.newEventLocked(event)
+		} else if b.options.Sequence != nil && b.options.Sequence(event) > b.nextSeq {
+			b.nextSeq = b.options.Sequence(event)
+		}
+		ch <- event
+	}
 	b.clients[ch] = struct{}{}
 	b.mu.Unlock()
 

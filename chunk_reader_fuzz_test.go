@@ -13,6 +13,11 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	bookpkg "github.com/igor-zatochniy/tts-reader/internal/book"
+	chunkpkg "github.com/igor-zatochniy/tts-reader/internal/chunk"
+	progresspkg "github.com/igor-zatochniy/tts-reader/internal/progress"
+	"github.com/igor-zatochniy/tts-reader/internal/tts"
 )
 
 const maxFuzzInputSize = 64 << 10
@@ -29,7 +34,7 @@ func FuzzChunkReader(f *testing.F) {
 		}
 		limit = normalizeFuzzLimit(limit)
 
-		reader, err := NewStreamingChunkReader(bytes.NewReader(data), 0, limit)
+		reader, err := chunkpkg.NewStreamingReader(bytes.NewReader(data), 0, limit)
 		if err != nil {
 			t.Fatalf("NewStreamingChunkReader returned unexpected error: %v", err)
 		}
@@ -84,7 +89,7 @@ func FuzzUTF8Boundary(f *testing.F) {
 			t.Skip("fuzz input is intentionally bounded for fast local runs")
 		}
 		path := writeFuzzFile(t, data)
-		got, err := isFileUTF8Boundary(path, pos, int64(len(data)))
+		got, err := chunkpkg.IsFileUTF8Boundary(path, pos, int64(len(data)))
 		if err != nil {
 			t.Fatalf("isFileUTF8Boundary returned error: %v", err)
 		}
@@ -119,11 +124,11 @@ func FuzzProgressLoad(f *testing.F) {
 		}
 
 		app := &App{
-			cfg:    Config{BookFile: bookPath, SaveFile: savePath},
+			cfg:    tts.Config{BookFile: bookPath, SaveFile: savePath},
 			stdout: io.Discard,
 			stderr: io.Discard,
 		}
-		identity, err := inspectBookFile(bookPath)
+		identity, err := bookpkg.InspectFile(bookPath)
 		if err != nil {
 			t.Fatalf("failed to inspect fuzz book: %v", err)
 		}
@@ -141,7 +146,7 @@ func FuzzProgressLoad(f *testing.F) {
 		if pos < 0 || pos >= int64(len(bookData)) {
 			t.Fatalf("loaded position is outside readable range: %d of %d", pos, len(bookData))
 		}
-		ok, err := isFileUTF8Boundary(bookPath, pos, int64(len(bookData)))
+		ok, err := chunkpkg.IsFileUTF8Boundary(bookPath, pos, int64(len(bookData)))
 		if err != nil {
 			t.Fatalf("failed to recheck loaded boundary: %v", err)
 		}
@@ -164,7 +169,7 @@ func FuzzStartPosition(f *testing.F) {
 		}
 
 		path := writeFuzzFile(t, bookData)
-		pos, found, err := findPhraseOffset(path, phrase)
+		pos, found, err := chunkpkg.FindPhraseOffset(path, phrase)
 		if err != nil {
 			if utf8.Valid(bookData) && utf8.ValidString(phrase) {
 				t.Fatalf("valid inputs returned error: %v", err)
@@ -181,7 +186,7 @@ func FuzzStartPosition(f *testing.F) {
 		if pos < 0 || pos > int64(len(bookData)) {
 			t.Fatalf("found position is outside book: %d of %d", pos, len(bookData))
 		}
-		ok, err := isFileUTF8Boundary(path, pos, int64(len(bookData)))
+		ok, err := chunkpkg.IsFileUTF8Boundary(path, pos, int64(len(bookData)))
 		if err != nil {
 			t.Fatalf("failed to validate found position boundary: %v", err)
 		}
@@ -230,7 +235,7 @@ func writeFuzzFile(t *testing.T, data []byte) string {
 	return path
 }
 
-func mustProgressJSON(t testing.TB, progress Progress) []byte {
+func mustProgressJSON(t testing.TB, progress progresspkg.Progress) []byte {
 	t.Helper()
 	data, err := json.Marshal(progress)
 	if err != nil {
@@ -239,12 +244,12 @@ func mustProgressJSON(t testing.TB, progress Progress) []byte {
 	return data
 }
 
-func progressSeedForData(data []byte, pos int64) Progress {
+func progressSeedForData(data []byte, pos int64) progresspkg.Progress {
 	identity := bookIdentityForBytes(data)
-	return progressForBook(progressBook("book.txt", "progress.json", identity), pos)
+	return progresspkg.ProgressForBook(progresspkg.BookForProgress("book.txt", "progress.json", identity), pos)
 }
 
-func bookIdentityForBytes(data []byte) BookFileIdentity {
+func bookIdentityForBytes(data []byte) bookpkg.FileIdentity {
 	hash := sha256.New()
 	fmt.Fprintf(hash, "size:%d\n", len(data))
 
@@ -260,7 +265,7 @@ func bookIdentityForBytes(data []byte) BookFileIdentity {
 		_, _ = hash.Write(data[len(data)-sampleSize:])
 	}
 
-	return BookFileIdentity{
+	return bookpkg.FileIdentity{
 		Size:        int64(len(data)),
 		Fingerprint: hex.EncodeToString(hash.Sum(nil)),
 	}

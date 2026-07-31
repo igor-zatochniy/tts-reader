@@ -11,6 +11,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	bookpkg "github.com/igor-zatochniy/tts-reader/internal/book"
+	chunkpkg "github.com/igor-zatochniy/tts-reader/internal/chunk"
+	progresspkg "github.com/igor-zatochniy/tts-reader/internal/progress"
+	"github.com/igor-zatochniy/tts-reader/internal/tts"
 )
 
 func TestRunMissingBookReturnsFailure(t *testing.T) {
@@ -139,19 +144,18 @@ func TestRunRejectsProgressFromDifferentBook(t *testing.T) {
 	}
 }
 
-func TestDefaultProgressPathUsesFullBookFileName(t *testing.T) {
+func TestDefaultProgressPathUsesSeparateHashedFiles(t *testing.T) {
 	dir := t.TempDir()
 	txt := filepath.Join(dir, "novel.txt")
 	md := filepath.Join(dir, "novel.md")
 
-	if defaultProgressPath(txt) != txt+".progress.json" {
-		t.Fatalf("неочікуваний progress path для txt: %q", defaultProgressPath(txt))
+	txtProgress := bookpkg.DefaultProgressPath(txt)
+	mdProgress := bookpkg.DefaultProgressPath(md)
+	if filepath.Dir(txtProgress) == filepath.Dir(txt) {
+		t.Fatalf("progress не має зберігатися поруч із книгою: %q", txtProgress)
 	}
-	if defaultProgressPath(md) != md+".progress.json" {
-		t.Fatalf("неочікуваний progress path для md: %q", defaultProgressPath(md))
-	}
-	if defaultProgressPath(txt) == defaultProgressPath(md) {
-		t.Fatalf("progress paths collide: %q", defaultProgressPath(txt))
+	if txtProgress == mdProgress {
+		t.Fatalf("progress paths collide: %q", txtProgress)
 	}
 }
 
@@ -160,7 +164,7 @@ func TestWriteFileReplaceReplacesProgressAndCleansTemp(t *testing.T) {
 	save := filepath.Join(dir, "book_save.json")
 	mustWriteFile(t, save, "old-progress")
 
-	if err := writeFileReplace(save, []byte("new-progress"), 0644); err != nil {
+	if err := progresspkg.WriteFileReplace(save, []byte("new-progress"), 0644); err != nil {
 		t.Fatalf("не вдалося замінити progress: %v", err)
 	}
 
@@ -180,7 +184,7 @@ func TestWriteFileReplaceKeepsTargetWhenReplaceFails(t *testing.T) {
 	mustWriteFile(t, save, "old-progress")
 	replaceErr := errors.New("replace failed")
 
-	err := writeFileReplaceWith(save, []byte("new-progress"), 0644, func(tmpName string, targetName string) error {
+	err := progresspkg.WriteFileReplaceWith(save, []byte("new-progress"), 0644, func(tmpName string, targetName string) error {
 		if targetName != save {
 			t.Fatalf("неочікуваний target: %q", targetName)
 		}
@@ -307,8 +311,8 @@ func TestRunRejectsInvalidUTF8Book(t *testing.T) {
 
 func TestFunctionEngineStopCancelsActiveSpeak(t *testing.T) {
 	started := make(chan struct{}, 1)
-	engine := newFunctionEngineFactory(
-		func(cfg Config) speakFunc {
+	engine := tts.NewFunctionEngineFactory(
+		func(cfg tts.Config) tts.SpeakFunc {
 			return func(ctx context.Context, text string) error {
 				select {
 				case started <- struct{}{}:
@@ -319,7 +323,7 @@ func TestFunctionEngineStopCancelsActiveSpeak(t *testing.T) {
 			}
 		},
 		func() ([]string, error) { return nil, nil },
-	)(Config{})
+	)(tts.Config{})
 
 	speakDone := make(chan error, 1)
 	go func() {
@@ -369,7 +373,7 @@ func TestSplitTextSmartKeepsUnicodeText(t *testing.T) {
 
 func TestStreamingChunkReaderKeepsUnicodeTextAndByteOffsets(t *testing.T) {
 	text := "Привіт, світе! Наступне речення."
-	reader, err := NewStreamingChunkReader(strings.NewReader(text), 0, 16)
+	reader, err := chunkpkg.NewStreamingReader(strings.NewReader(text), 0, 16)
 	if err != nil {
 		t.Fatalf("не вдалося створити streaming reader: %v", err)
 	}
@@ -402,8 +406,8 @@ func TestStreamingChunkReaderKeepsUnicodeTextAndByteOffsets(t *testing.T) {
 	}
 }
 
-func testSpeaker(fn func(text string) error) speakerFactory {
-	return func(cfg Config) speakFunc {
+func testSpeaker(fn func(text string) error) tts.SpeakerFactory {
+	return func(cfg tts.Config) tts.SpeakFunc {
 		if fn != nil {
 			return func(ctx context.Context, text string) error {
 				return fn(text)
@@ -422,7 +426,7 @@ func mustWriteFile(t *testing.T, path string, content string) {
 	}
 }
 
-func mustWriteProgress(t *testing.T, path string, progress Progress) {
+func mustWriteProgress(t *testing.T, path string, progress progresspkg.Progress) {
 	t.Helper()
 	data, err := json.Marshal(progress)
 	if err != nil {
@@ -433,13 +437,13 @@ func mustWriteProgress(t *testing.T, path string, progress Progress) {
 	}
 }
 
-func progressForPath(t *testing.T, bookPath string, savePath string, pos int64) Progress {
+func progressForPath(t *testing.T, bookPath string, savePath string, pos int64) progresspkg.Progress {
 	t.Helper()
-	identity, err := inspectBookFile(bookPath)
+	identity, err := bookpkg.InspectFile(bookPath)
 	if err != nil {
 		t.Fatalf("не вдалося отримати fingerprint книги: %v", err)
 	}
-	return progressForBook(progressBook(bookPath, savePath, identity), pos)
+	return progresspkg.ProgressForBook(progresspkg.BookForProgress(bookPath, savePath, identity), pos)
 }
 
 func assertNoProgressTemps(t *testing.T, dir string, target string) {
@@ -460,18 +464,18 @@ func assertSavedPosition(t *testing.T, path string, want int64) {
 		t.Fatalf("не вдалося прочитати прогрес: %v", err)
 	}
 
-	var got Progress
+	var got progresspkg.Progress
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("не вдалося розібрати прогрес: %v", err)
 	}
 	if got.LastPosition != want {
 		t.Fatalf("очікував позицію %d, отримав %d", want, got.LastPosition)
 	}
-	if got.Version != ProgressVersion {
-		t.Fatalf("очікував version %d, отримав %d", ProgressVersion, got.Version)
+	if got.Version != progresspkg.Version {
+		t.Fatalf("очікував version %d, отримав %d", progresspkg.Version, got.Version)
 	}
-	if got.PositionUnit != PositionUnit {
-		t.Fatalf("очікував position_unit %q, отримав %q", PositionUnit, got.PositionUnit)
+	if got.PositionUnit != progresspkg.Unit {
+		t.Fatalf("очікував position_unit %q, отримав %q", progresspkg.Unit, got.PositionUnit)
 	}
 	if got.BookSize < 0 || got.BookFingerprint == "" {
 		t.Fatalf("progress не прив'язаний до книги: %#v", got)

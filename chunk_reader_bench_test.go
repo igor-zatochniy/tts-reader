@@ -5,6 +5,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/igor-zatochniy/tts-reader/internal/chunk"
 )
 
 var benchmarkChunkSink struct {
@@ -63,7 +65,7 @@ func benchmarkChunkers(b *testing.B, text string) {
 		var bytesCount int64
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			reader, err := NewStreamingChunkReader(strings.NewReader(text), 0, chunkSize)
+			reader, err := chunk.NewStreamingReader(strings.NewReader(text), 0, chunkSize)
 			if err != nil {
 				b.Fatalf("не вдалося створити streaming reader: %v", err)
 			}

@@ -38,7 +38,8 @@
 ### API token
 
 - Для state-changing запитів використовується token.
-- Токен передається через `X-TTS-Token` або query string для браузерної панелі.
+- State-changing endpoints приймають token тільки через `X-TTS-Token`.
+- Query token дозволений лише для `GET /api/v1/events`, оскільки browser `EventSource` не підтримує custom headers.
 - Після завантаження сторінки токен прибирається з адресного рядка через `history.replaceState(...)`.
 
 ### Безпечні HTTP-помилки

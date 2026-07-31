@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -26,15 +27,17 @@ func speakWindows(parent context.Context, text string, voice string, timeout tim
 	defer cancel()
 
 	cmd := newSpeakWindowsCommand(ctx, text, voice)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("TTS command timed out after %s", timeout)
+			return powerShellCommandError(fmt.Sprintf("TTS command timed out after %s", timeout), ctx.Err(), stderr.String())
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return err
+		return powerShellCommandError("TTS command failed", err, stderr.String())
 	}
 	return nil
 }
@@ -89,20 +92,36 @@ func listVoices() ([]string, error) {
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
-	output, err := cmd.Output()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("voice discovery timed out")
+			return nil, powerShellCommandError("voice discovery timed out", ctx.Err(), stderr.String())
 		}
-		return nil, err
+		return nil, powerShellCommandError("voice discovery failed", err, stderr.String())
 	}
 
 	var voices []string
-	for _, line := range strings.Split(string(output), "\n") {
+	for _, line := range strings.Split(stdout.String(), "\n") {
 		voice := strings.TrimSpace(line)
 		if voice != "" {
 			voices = append(voices, voice)
 		}
 	}
 	return voices, nil
+}
+
+func powerShellCommandError(operation string, err error, stderr string) error {
+	detail := strings.TrimSpace(stderr)
+	const maxDetailBytes = 4096
+	if len(detail) > maxDetailBytes {
+		detail = detail[:maxDetailBytes] + "..."
+	}
+	if detail == "" {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return fmt.Errorf("%s: %w: %s", operation, err, detail)
 }

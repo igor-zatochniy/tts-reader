@@ -74,7 +74,7 @@ func (JSONProgressStore) Save(book book.Book, pos int64) error {
 	if err != nil {
 		return fmt.Errorf("marshal progress: %w", err)
 	}
-	if err := WriteFileReplace(book.SaveFile, data, 0644); err != nil {
+	if err := WriteFileReplace(book.SaveFile, data, 0600); err != nil {
 		return fmt.Errorf("replace progress file: %w", err)
 	}
 	return nil
