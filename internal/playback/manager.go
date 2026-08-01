@@ -69,6 +69,11 @@ type EventBroker struct {
 	broker *events.Broker[PlaybackEvent]
 }
 
+type playbackEventStream interface {
+	subscribeSnapshot(PlaybackSnapshot) (<-chan PlaybackEvent, func())
+	PublishPlayback(string, PlaybackSnapshot)
+}
+
 type EngineFactory = tts.EngineFactory
 type ProgressStore = progress.ProgressStore
 type TTSEngine = tts.Engine
@@ -107,12 +112,22 @@ func (b *EventBroker) PublishPlayback(eventType string, snapshot PlaybackSnapsho
 }
 
 type playbackSession struct {
-	id             uint64
-	ctx            context.Context
-	cancel         context.CancelFunc
-	done           chan struct{}
-	engine         TTSEngine
-	stopWaitActive bool
+	id            uint64
+	ctx           context.Context
+	cancel        context.CancelFunc
+	done          chan struct{}
+	engine        TTSEngine
+	stopDone      chan struct{}
+	stopStarted   bool
+	stopFinished  bool
+	engineStopErr error
+	finalErr      error
+}
+
+type sessionResult struct {
+	state    string
+	position int64
+	err      error
 }
 
 type PlaybackManager struct {
@@ -121,7 +136,7 @@ type PlaybackManager struct {
 	cond       *sync.Cond
 	engines    EngineFactory
 	ttsTimeout time.Duration
-	events     *EventBroker
+	events     playbackEventStream
 	progress   ProgressStore
 
 	state             string
@@ -168,8 +183,15 @@ func NewManager(engines EngineFactory, ttsTimeout time.Duration, events *EventBr
 }
 
 func NewManagerWithProgress(engines EngineFactory, ttsTimeout time.Duration, events *EventBroker, progressStore ProgressStore) *PlaybackManager {
+	return newManagerWithEventStream(engines, ttsTimeout, events, progressStore)
+}
+
+func newManagerWithEventStream(engines EngineFactory, ttsTimeout time.Duration, events playbackEventStream, progressStore ProgressStore) *PlaybackManager {
 	if progressStore == nil {
 		progressStore = progress.JSONProgressStore{}
+	}
+	if events == nil {
+		events = NewEventBroker()
 	}
 	m := &PlaybackManager{
 		engines:    engines,
@@ -241,11 +263,12 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 	}
 	m.nextID++
 	session := &playbackSession{
-		id:     m.nextID,
-		ctx:    ctx,
-		cancel: cancel,
-		done:   make(chan struct{}),
-		engine: engine,
+		id:       m.nextID,
+		ctx:      ctx,
+		cancel:   cancel,
+		done:     make(chan struct{}),
+		engine:   engine,
+		stopDone: make(chan struct{}),
 	}
 	m.state = Playing
 	m.book = book
@@ -256,10 +279,9 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 	m.chunkSize = chunkSize
 	m.lastErr = nil
 	m.active = session
-	snapshot := m.snapshotLocked()
+	snapshot := m.publishLocked("playback.started")
 	m.mu.Unlock()
 
-	m.publish("playback.started", snapshot)
 	go m.play(session, book, startPos, chunkSize)
 	return snapshot, nil
 }
@@ -279,10 +301,9 @@ func (m *PlaybackManager) Pause() (PlaybackSnapshot, error) {
 		return snapshot, ErrNotPlaying
 	}
 	m.state = Paused
-	snapshot := m.snapshotLocked()
+	snapshot := m.publishLocked("playback.paused")
 	m.mu.Unlock()
 
-	m.publish("playback.paused", snapshot)
 	return snapshot, nil
 }
 
@@ -302,10 +323,9 @@ func (m *PlaybackManager) Resume() (PlaybackSnapshot, error) {
 	}
 	m.state = Playing
 	m.cond.Broadcast()
-	snapshot := m.snapshotLocked()
+	snapshot := m.publishLocked("playback.resumed")
 	m.mu.Unlock()
 
-	m.publish("playback.resumed", snapshot)
 	return snapshot, nil
 }
 
@@ -317,107 +337,72 @@ func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
 		ctx = context.Background()
 	}
 
-	var session *playbackSession
-	var book bookpkg.Book
-
 	m.mu.Lock()
-	session = m.active
-	if m.book.ID != "" {
-		book = m.book
-	}
-	if session != nil {
-		m.state = Stopping
-		session.stopWaitActive = true
-	} else {
+	session := m.active
+	if session == nil {
 		m.state = Stopped
+		m.lastErr = nil
+		snapshot := m.publishLocked("playback.stopped")
+		m.mu.Unlock()
+		return snapshot, nil
 	}
-	m.lastErr = nil
-	snapshot := m.snapshotLocked()
-	m.cond.Broadcast()
+
+	startStop := !session.stopStarted
+	if startStop {
+		session.stopStarted = true
+		m.state = Stopping
+		m.lastErr = nil
+		m.cond.Broadcast()
+		m.publishLocked("playback.stopping")
+	}
 	m.mu.Unlock()
 
-	if session != nil {
-		m.publish("playback.stopping", snapshot)
-	}
-
-	var stopErr error
-	waited := session == nil
-	if session != nil {
+	if startStop {
 		session.cancel()
-		stopErr = errors.Join(stopErr, session.engine.Stop(ctx))
-		select {
-		case <-session.done:
-			waited = true
-		case <-ctx.Done():
-			stopErr = errors.Join(stopErr, ctx.Err())
-			select {
-			case <-session.done:
-				waited = true
-			default:
-			}
-		}
-	}
-	if session != nil && !waited {
+		engineStopErr := session.engine.Stop(ctx)
 		m.mu.Lock()
-		if m.active == session {
-			session.stopWaitActive = false
+		if !session.stopFinished {
+			session.engineStopErr = engineStopErr
+			session.stopFinished = true
+			close(session.stopDone)
 		}
 		m.mu.Unlock()
+	}
+
+	return m.waitForSessionStop(ctx, session)
+}
+
+func (m *PlaybackManager) waitForSessionStop(ctx context.Context, session *playbackSession) (PlaybackSnapshot, error) {
+	select {
+	case <-session.done:
+		m.mu.Lock()
+		snapshot := m.snapshotLocked()
+		finalErr := session.finalErr
+		m.mu.Unlock()
+		return snapshot, finalErr
+	case <-ctx.Done():
 		select {
 		case <-session.done:
-			waited = true
+			m.mu.Lock()
+			snapshot := m.snapshotLocked()
+			finalErr := session.finalErr
+			m.mu.Unlock()
+			return snapshot, finalErr
 		default:
 		}
 	}
-	var pos int64
-	if book.ID != "" {
-		m.mu.Lock()
-		pos = m.durablePosition
-		if waited {
-			m.currentByte = pos
-			m.currentChunkStart = pos
-		}
-		m.mu.Unlock()
-		if waited {
-			stopErr = errors.Join(stopErr, m.progress.Save(book, pos))
-		}
-	}
 
 	m.mu.Lock()
-	publishStopped := false
-	stillStopping := false
-	if session != nil && m.active == session {
-		session.stopWaitActive = false
+	snapshot := m.snapshotLocked()
+	if m.active != session {
+		finalErr := session.finalErr
+		m.mu.Unlock()
+		return snapshot, finalErr
 	}
-	if waited {
-		if session == nil {
-			publishStopped = true
-		} else if m.active == session {
-			m.active = nil
-			publishStopped = true
-		}
-	}
-	if publishStopped {
-		m.state = Stopped
-		if book.ID != "" {
-			m.currentByte = pos
-			m.currentChunkStart = pos
-		}
-	} else if session != nil && m.active == session {
-		m.state = Stopping
-		stillStopping = true
-	}
-	if stillStopping {
-		stopErr = errors.Join(stopErr, ErrStopping)
-	}
-	m.lastErr = stopErr
-	snapshot = m.snapshotLocked()
+	engineStopErr := session.engineStopErr
 	m.mu.Unlock()
-
-	if publishStopped {
-		m.publish("playback.stopped", snapshot)
-	}
-	return snapshot, stopErr
+	snapshot.ErrorCode = "playback_stopping"
+	return snapshot, errors.Join(engineStopErr, ctx.Err(), ErrStopping)
 }
 
 func (m *PlaybackManager) SetPosition(book bookpkg.Book, pos int64) (PlaybackSnapshot, error) {
@@ -472,10 +457,9 @@ func (m *PlaybackManager) SetPosition(book bookpkg.Book, pos int64) (PlaybackSna
 	m.durablePosition = pos
 	m.state = Stopped
 	m.lastErr = nil
-	snapshot := m.snapshotLocked()
+	snapshot := m.publishLocked("position.updated")
 	m.mu.Unlock()
 
-	m.publish("position.updated", snapshot)
 	return snapshot, nil
 }
 
@@ -500,57 +484,52 @@ func (m *PlaybackManager) SubscribeEvents() (<-chan PlaybackEvent, func()) {
 }
 
 func (m *PlaybackManager) play(session *playbackSession, book bookpkg.Book, startPos int64, chunkSize int) {
-	// defer виконується у зворотному порядку: стан сесії очищається до сигналу done.
-	defer close(session.done)
-	defer m.clearActiveSession(session.id)
+	result := m.runPlayback(session, book, startPos, chunkSize)
+	m.finalizeSession(session, book, result)
+	close(session.done)
+}
 
+func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Book, startPos int64, chunkSize int) sessionResult {
 	file, err := os.Open(book.Path)
 	if err != nil {
-		m.fail(session.id, book, startPos, err)
-		return
+		return sessionResult{state: Failed, position: startPos, err: err}
 	}
 	defer file.Close()
 
 	if _, err := file.Seek(startPos, io.SeekStart); err != nil {
-		m.fail(session.id, book, startPos, err)
-		return
+		return sessionResult{state: Failed, position: startPos, err: err}
 	}
 
 	reader, err := chunk.NewStreamingReader(file, startPos, chunkSize)
 	if err != nil {
-		m.fail(session.id, book, startPos, err)
-		return
+		return sessionResult{state: Failed, position: startPos, err: err}
 	}
 
 	for {
 		if !m.waitUntilPlayable(session) {
-			return
+			return sessionResult{state: Stopped}
 		}
 
 		chunk, err := reader.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				m.finish(session.id, book)
-				return
+				return sessionResult{state: Finished, position: book.Size}
 			}
-			m.fail(session.id, book, m.current(), err)
-			return
+			return sessionResult{state: Failed, position: m.current(), err: err}
 		}
 
 		m.updateProgress(session.id, "chunk.started", chunk.StartByte)
 		if err := session.engine.Speak(session.ctx, chunk.Text); err != nil {
 			if session.ctx.Err() != nil {
-				return
+				return sessionResult{state: Stopped}
 			}
-			m.fail(session.id, book, chunk.StartByte, err)
-			return
+			return sessionResult{state: Failed, position: chunk.StartByte, err: err}
 		}
 		if session.ctx.Err() != nil {
-			return
+			return sessionResult{state: Stopped}
 		}
 		if err := m.progress.Save(book, chunk.EndByte); err != nil {
-			m.fail(session.id, book, chunk.StartByte, fmt.Errorf("save progress: %w", err))
-			return
+			return sessionResult{state: Failed, position: chunk.StartByte, err: fmt.Errorf("save progress: %w", err)}
 		}
 		m.markDurablePosition(session.id, chunk.EndByte)
 		m.updateProgress(session.id, "progress.updated", chunk.EndByte)
@@ -586,87 +565,79 @@ func (m *PlaybackManager) updateProgress(sessionID uint64, eventType string, pos
 		m.currentChunkStart = pos
 	}
 	m.currentByte = pos
-	snapshot := m.snapshotLocked()
+	m.publishLocked(eventType)
 	m.mu.Unlock()
-
-	m.publish(eventType, snapshot)
 }
 
-func (m *PlaybackManager) finish(sessionID uint64, book bookpkg.Book) {
-	if !m.isActiveSession(sessionID) {
-		return
-	}
-
-	if err := m.progress.Reset(book); err != nil {
-		m.completeWithPersistenceFailure(sessionID, book.Size, fmt.Errorf("playback completed but progress reset failed: %w", err))
-		return
-	}
-
+func (m *PlaybackManager) finalizeSession(session *playbackSession, book bookpkg.Book, result sessionResult) {
 	m.mu.Lock()
-	if !m.sessionIsActiveLocked(sessionID) || m.state == Stopped || m.state == Stopping {
+	if m.active != session {
 		m.mu.Unlock()
 		return
 	}
-	m.state = Finished
-	m.currentByte = book.Size
-	m.currentChunkStart = book.Size
-	m.durablePosition = 0
-	m.lastErr = nil
-	m.active = nil
-	snapshot := m.snapshotLocked()
-	m.mu.Unlock()
 
-	m.publish("playback.finished", snapshot)
-}
-
-func (m *PlaybackManager) fail(sessionID uint64, book bookpkg.Book, pos int64, err error) {
-	if !m.isActiveSession(sessionID) {
-		return
+	if result.state == Stopped || m.state == Stopping {
+		result.state = Stopped
+		for session.stopStarted && !session.stopFinished {
+			m.mu.Unlock()
+			<-session.stopDone
+			m.mu.Lock()
+			if m.active != session {
+				m.mu.Unlock()
+				return
+			}
+		}
 	}
 
-	saveErr := m.progress.Save(book, pos)
-	finalErr := errors.Join(err, saveErr)
-
-	m.mu.Lock()
-	if !m.sessionIsActiveLocked(sessionID) || m.state == Stopped || m.state == Stopping {
-		m.mu.Unlock()
-		return
+	var eventType string
+	var finalErr error
+	switch result.state {
+	case Finished:
+		if err := m.progress.Reset(book); err != nil {
+			m.state = Failed
+			m.currentByte = book.Size
+			m.currentChunkStart = book.Size
+			finalErr = fmt.Errorf("playback completed but progress reset failed: %w", err)
+			eventType = "playback.failed"
+		} else {
+			m.state = Finished
+			m.currentByte = book.Size
+			m.currentChunkStart = book.Size
+			m.durablePosition = 0
+			eventType = "playback.finished"
+		}
+	case Failed:
+		saveErr := m.progress.Save(book, result.position)
+		finalErr = errors.Join(result.err, saveErr)
+		m.state = Failed
+		m.currentByte = result.position
+		m.currentChunkStart = result.position
+		if saveErr == nil {
+			m.durablePosition = result.position
+		}
+		eventType = "playback.failed"
+	default:
+		position := m.durablePosition
+		saveErr := m.progress.Save(book, position)
+		finalErr = errors.Join(terminalEngineStopError(session.engineStopErr), saveErr)
+		m.state = Stopped
+		m.currentByte = position
+		m.currentChunkStart = position
+		eventType = "playback.stopped"
 	}
-	m.state = Failed
-	m.currentByte = pos
-	m.currentChunkStart = pos
+
 	m.lastErr = finalErr
 	m.active = nil
-	if saveErr == nil {
-		m.durablePosition = pos
-	}
-	snapshot := m.snapshotLocked()
+	session.finalErr = finalErr
+	m.publishLocked(eventType)
 	m.mu.Unlock()
-
-	m.publish("playback.failed", snapshot)
 }
 
-func (m *PlaybackManager) completeWithPersistenceFailure(sessionID uint64, pos int64, err error) {
-	m.mu.Lock()
-	if !m.sessionIsActiveLocked(sessionID) || m.state == Stopped || m.state == Stopping {
-		m.mu.Unlock()
-		return
+func terminalEngineStopError(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
 	}
-	m.state = Failed
-	m.currentByte = pos
-	m.currentChunkStart = pos
-	m.lastErr = err
-	m.active = nil
-	snapshot := m.snapshotLocked()
-	m.mu.Unlock()
-
-	m.publish("playback.failed", snapshot)
-}
-
-func (m *PlaybackManager) isActiveSession(sessionID uint64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sessionIsActiveLocked(sessionID) && m.state != Stopped && m.state != Stopping
+	return err
 }
 
 func (m *PlaybackManager) sessionIsActiveLocked(sessionID uint64) bool {
@@ -679,26 +650,6 @@ func (m *PlaybackManager) markDurablePosition(sessionID uint64, pos int64) {
 		m.durablePosition = pos
 	}
 	m.mu.Unlock()
-}
-
-func (m *PlaybackManager) clearActiveSession(sessionID uint64) {
-	m.mu.Lock()
-	var snapshot PlaybackSnapshot
-	publishStopped := false
-	if m.active != nil && m.active.id == sessionID && m.state == Stopping && !m.active.stopWaitActive {
-		m.active = nil
-		m.state = Stopped
-		m.currentByte = m.durablePosition
-		m.currentChunkStart = m.durablePosition
-		m.lastErr = nil
-		snapshot = m.snapshotLocked()
-		publishStopped = true
-	}
-	m.mu.Unlock()
-
-	if publishStopped {
-		m.publish("playback.stopped", snapshot)
-	}
 }
 
 func (m *PlaybackManager) snapshotLocked() PlaybackSnapshot {
@@ -724,6 +675,8 @@ func playbackErrorCode(err error) string {
 	return "internal_error"
 }
 
-func (m *PlaybackManager) publish(eventType string, snapshot PlaybackSnapshot) {
+func (m *PlaybackManager) publishLocked(eventType string) PlaybackSnapshot {
+	snapshot := m.snapshotLocked()
 	m.events.PublishPlayback(eventType, snapshot)
+	return snapshot
 }

@@ -358,8 +358,8 @@ func TestPlaybackStopTimeoutLeavesSessionStopping(t *testing.T) {
 	}
 
 	close(releaseSpeak)
-	if snapshot := waitForManagerState(t, manager, playbackpkg.Stopped); snapshot.State != playbackpkg.Stopped {
-		t.Fatalf("після завершення goroutine очікував stopped, отримав %#v", snapshot)
+	if snapshot := waitForManagerState(t, manager, playbackpkg.Stopped); snapshot.State != playbackpkg.Stopped || snapshot.ErrorCode != "" {
+		t.Fatalf("після завершення goroutine очікував stopped без transient error, отримав %#v", snapshot)
 	}
 	if _, err := manager.Start(book, playbackpkg.StartRequest{
 		BookID:    book.ID,

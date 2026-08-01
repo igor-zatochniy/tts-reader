@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -70,7 +71,7 @@ func TestPlaybackManagerIgnoresStaleSessionFailure(t *testing.T) {
 	}
 
 	manager.mu.Lock()
-	oldSessionID := manager.active.id
+	oldSession := manager.active
 	manager.mu.Unlock()
 
 	if _, err := manager.Stop(context.Background()); err != nil {
@@ -93,7 +94,7 @@ func TestPlaybackManagerIgnoresStaleSessionFailure(t *testing.T) {
 		t.Fatalf("не вдалося підготувати прогрес першої книги: %v", err)
 	}
 
-	manager.fail(oldSessionID, firstBook, 0, context.Canceled)
+	manager.finalizeSession(oldSession, firstBook, sessionResult{state: Failed, position: 0, err: context.Canceled})
 	snapshot := manager.Snapshot()
 	if snapshot.State == Failed || snapshot.BookID != secondBook.ID {
 		t.Fatalf("stale session corrupted active playback: %#v", snapshot)
@@ -102,6 +103,125 @@ func TestPlaybackManagerIgnoresStaleSessionFailure(t *testing.T) {
 
 	close(secondRelease)
 	waitState(t, manager, Finished)
+}
+
+func TestPlaybackStopTimeoutFinalizesWithoutTransientError(t *testing.T) {
+	started := make(chan struct{}, 1)
+	releaseSpeak := make(chan struct{})
+	store := &trackingProgressStore{loadPosition: 4}
+	manager := NewManagerWithProgress(
+		func(tts.Config) tts.Engine {
+			return &testEngine{
+				speakContext: func(ctx context.Context, text string) error {
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					<-releaseSpeak
+					return nil
+				},
+				stop: func(ctx context.Context) error {
+					<-ctx.Done()
+					return ctx.Err()
+				},
+			}
+		},
+		time.Second,
+		NewEventBroker(),
+		store,
+	)
+	registeredBook := mustBook(t, writeTempBook(t, "0123456789. Далі."))
+
+	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID, ChunkSize: intPtr(128)}); err != nil {
+		t.Fatalf("не вдалося запустити playback: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("playback не стартував")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	snapshot, err := manager.Stop(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrStopping) {
+		t.Fatalf("очікувалися deadline та ErrStopping, отримано snapshot=%#v err=%v", snapshot, err)
+	}
+	if snapshot.State != Stopping {
+		t.Fatalf("після timeout очікувався stopping, отримано %#v", snapshot)
+	}
+
+	close(releaseSpeak)
+	snapshot = waitState(t, manager, Stopped)
+	if snapshot.ErrorCode != "" {
+		t.Fatalf("transient timeout не має залишатися у terminal snapshot: %#v", snapshot)
+	}
+
+	manager.mu.Lock()
+	active := manager.active
+	durable := manager.durablePosition
+	current := manager.currentByte
+	manager.mu.Unlock()
+	if active != nil {
+		t.Fatalf("single-owner finalizer не очистив active session")
+	}
+	if current != durable || durable != store.lastSavedPosition() {
+		t.Fatalf("terminal progress не збігається: current=%d durable=%d saved=%d", current, durable, store.lastSavedPosition())
+	}
+}
+
+func TestPlaybackEventsPreserveTransitionOrder(t *testing.T) {
+	events := newBlockingEventStream()
+	manager := newManagerWithEventStream(
+		func(tts.Config) tts.Engine {
+			return &testEngine{speakContext: func(ctx context.Context, text string) error {
+				<-ctx.Done()
+				return ctx.Err()
+			}}
+		},
+		time.Second,
+		events,
+		&trackingProgressStore{},
+	)
+	registeredBook := mustBook(t, writeTempBook(t, "Порядок подій."))
+	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID, ChunkSize: intPtr(128)}); err != nil {
+		t.Fatalf("не вдалося запустити playback: %v", err)
+	}
+
+	manager.mu.Lock()
+	sessionID := manager.active.id
+	manager.mu.Unlock()
+	progressDone := make(chan struct{})
+	go func() {
+		manager.updateProgress(sessionID, "progress.updated", 0)
+		close(progressDone)
+	}()
+
+	select {
+	case <-events.progressPrepared:
+	case <-time.After(2 * time.Second):
+		t.Fatal("progress event не дійшов до контрольованої затримки")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Stop(context.Background())
+		stopDone <- err
+	}()
+
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop не має обігнати заблокований progress event: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(events.releaseProgress)
+	<-progressDone
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop завершився з помилкою: %v", err)
+	}
+
+	assertNoActiveStateAfterStopping(t, events.snapshot())
 }
 
 func TestPlaybackManagerRejectsStartAfterBeginShutdown(t *testing.T) {
@@ -310,6 +430,95 @@ func TestConcurrentStartAndSetPositionMaintainsConsistentState(t *testing.T) {
 	}
 }
 
+func TestPlaybackStateMachineStress(t *testing.T) {
+	registeredBook := mustBook(t, writeTempBook(t, "Перший. Другий. Третій."))
+
+	for iteration := 0; iteration < 10; iteration++ {
+		started := make(chan struct{}, 1)
+		manager := NewManagerWithProgress(
+			func(tts.Config) tts.Engine {
+				return &testEngine{speakContext: func(ctx context.Context, text string) error {
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					<-ctx.Done()
+					return ctx.Err()
+				}}
+			},
+			time.Second,
+			NewEventBroker(),
+			&trackingProgressStore{},
+		)
+
+		eventChannel, unsubscribe := manager.SubscribeEvents()
+		var eventMu sync.Mutex
+		var received []PlaybackEvent
+		collectorDone := make(chan struct{})
+		go func() {
+			defer close(collectorDone)
+			for event := range eventChannel {
+				eventMu.Lock()
+				received = append(received, event)
+				eventMu.Unlock()
+			}
+		}()
+
+		if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID, ChunkSize: intPtr(8)}); err != nil {
+			t.Fatalf("iteration %d: не вдалося запустити playback: %v", iteration, err)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: playback не стартував", iteration)
+		}
+
+		operations := []func(){
+			func() { _, _ = manager.Pause() },
+			func() { _, _ = manager.Resume() },
+			func() { _, _ = manager.SetPosition(registeredBook, 0) },
+			func() {
+				events, cancel := manager.SubscribeEvents()
+				select {
+				case <-events:
+				case <-time.After(time.Second):
+					t.Errorf("iteration %d: atomic subscription не отримала snapshot", iteration)
+				}
+				cancel()
+			},
+			manager.BeginShutdown,
+			func() { _, _ = manager.Stop(context.Background()) },
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(len(operations))
+		for _, operation := range operations {
+			operation := operation
+			go func() {
+				defer wg.Done()
+				operation()
+				assertPlaybackInvariants(t, manager)
+			}()
+		}
+		wg.Wait()
+
+		if snapshot := waitState(t, manager, Stopped); snapshot.ErrorCode != "" {
+			t.Fatalf("iteration %d: stopped snapshot містить помилку: %#v", iteration, snapshot)
+		}
+		if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID}); !errors.Is(err, ErrShuttingDown) {
+			t.Fatalf("iteration %d: Start після BeginShutdown повернув %v", iteration, err)
+		}
+		assertPlaybackInvariants(t, manager)
+
+		unsubscribe()
+		<-collectorDone
+		eventMu.Lock()
+		events := append([]PlaybackEvent(nil), received...)
+		eventMu.Unlock()
+		assertMonotonicTerminalEvents(t, events)
+	}
+}
+
 func TestFinishFailsWhenProgressResetClearsSession(t *testing.T) {
 	resetErr := errors.New("reset denied")
 	manager := NewManagerWithProgress(
@@ -363,6 +572,89 @@ type failingProgressStore struct {
 	loadErr  error
 	saveErr  error
 	resetErr error
+}
+
+type trackingProgressStore struct {
+	mu           sync.Mutex
+	loadPosition int64
+	saved        []int64
+}
+
+func (s *trackingProgressStore) Load(book.Book, int64) (int64, error) {
+	return s.loadPosition, nil
+}
+
+func (s *trackingProgressStore) Save(_ book.Book, position int64) error {
+	s.mu.Lock()
+	s.saved = append(s.saved, position)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *trackingProgressStore) Reset(book book.Book) error {
+	return s.Save(book, 0)
+}
+
+func (s *trackingProgressStore) lastSavedPosition() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.saved) == 0 {
+		return -1
+	}
+	return s.saved[len(s.saved)-1]
+}
+
+type blockingEventStream struct {
+	mu               sync.Mutex
+	nextSeq          uint64
+	events           []PlaybackEvent
+	progressPrepared chan struct{}
+	releaseProgress  chan struct{}
+	blockProgress    sync.Once
+}
+
+func newBlockingEventStream() *blockingEventStream {
+	return &blockingEventStream{
+		progressPrepared: make(chan struct{}),
+		releaseProgress:  make(chan struct{}),
+	}
+}
+
+func (s *blockingEventStream) subscribeSnapshot(snapshot PlaybackSnapshot) (<-chan PlaybackEvent, func()) {
+	ch := make(chan PlaybackEvent, 1)
+	s.mu.Lock()
+	s.nextSeq++
+	event := PlaybackEvent{Seq: s.nextSeq, Type: "playback.snapshot", Playback: snapshot}
+	s.events = append(s.events, event)
+	s.mu.Unlock()
+	ch <- event
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() { close(ch) })
+	}
+}
+
+func (s *blockingEventStream) PublishPlayback(eventType string, snapshot PlaybackSnapshot) {
+	if eventType == "progress.updated" {
+		s.blockProgress.Do(func() {
+			close(s.progressPrepared)
+			<-s.releaseProgress
+		})
+	}
+	s.mu.Lock()
+	s.nextSeq++
+	s.events = append(s.events, PlaybackEvent{
+		Seq:      s.nextSeq,
+		Type:     eventType,
+		Playback: snapshot,
+	})
+	s.mu.Unlock()
+}
+
+func (s *blockingEventStream) snapshot() []PlaybackEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]PlaybackEvent(nil), s.events...)
 }
 
 func (s *failingProgressStore) Load(book book.Book, currentSize int64) (int64, error) {
@@ -477,6 +769,79 @@ func receivePlaybackEvent(t *testing.T, events <-chan PlaybackEvent) PlaybackEve
 	case <-time.After(time.Second):
 		t.Fatal("playback event не надійшов")
 		return PlaybackEvent{}
+	}
+}
+
+func assertNoActiveStateAfterStopping(t *testing.T, events []PlaybackEvent) {
+	t.Helper()
+	progressIndex := -1
+	stoppingIndex := -1
+	stoppedIndex := -1
+	for index, event := range events {
+		switch event.Type {
+		case "progress.updated":
+			if progressIndex == -1 {
+				progressIndex = index
+			}
+		case "playback.stopping":
+			if stoppingIndex == -1 {
+				stoppingIndex = index
+			}
+		case "playback.stopped":
+			stoppedIndex = index
+		}
+		if stoppingIndex != -1 && (event.Playback.State == Playing || event.Playback.State == Paused) {
+			t.Fatalf("active state з'явився після stopping: %#v", events)
+		}
+	}
+	if progressIndex == -1 || stoppingIndex == -1 || stoppedIndex == -1 {
+		t.Fatalf("бракує обов'язкових подій: %#v", events)
+	}
+	if progressIndex > stoppingIndex || stoppingIndex > stoppedIndex {
+		t.Fatalf("порушено порядок progress -> stopping -> stopped: %#v", events)
+	}
+}
+
+func assertPlaybackInvariants(t *testing.T, manager *PlaybackManager) {
+	t.Helper()
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	activeExpected := manager.state == Playing || manager.state == Paused || manager.state == Stopping
+	if activeExpected != (manager.active != nil) {
+		t.Errorf("state/active invariant порушено: state=%q active=%v", manager.state, manager.active != nil)
+	}
+	if manager.currentByte < 0 || manager.currentByte > manager.book.Size {
+		t.Errorf("currentByte поза межами книги: current=%d size=%d", manager.currentByte, manager.book.Size)
+	}
+	if manager.durablePosition < 0 || manager.durablePosition > manager.book.Size {
+		t.Errorf("durablePosition поза межами книги: durable=%d size=%d", manager.durablePosition, manager.book.Size)
+	}
+}
+
+func assertMonotonicTerminalEvents(t *testing.T, events []PlaybackEvent) {
+	t.Helper()
+	var previousSeq uint64
+	activeSeen := false
+	terminalSeen := false
+	for _, event := range events {
+		if event.Seq <= previousSeq {
+			t.Fatalf("sequence має строго зростати: previous=%d event=%#v", previousSeq, event)
+		}
+		previousSeq = event.Seq
+		if event.Playback.State == Playing || event.Playback.State == Paused {
+			activeSeen = true
+		}
+		if activeSeen && (event.Playback.State == Stopping || event.Playback.State == Stopped ||
+			event.Playback.State == Finished || event.Playback.State == Failed) {
+			terminalSeen = true
+		}
+		if terminalSeen && (event.Playback.State == Playing || event.Playback.State == Paused) {
+			t.Fatalf("застарілий active state після terminal transition: %s", fmt.Sprint(events))
+		}
+	}
+	if !terminalSeen {
+		t.Fatalf("stress run не містить terminal transition: %#v", events)
 	}
 }
 

@@ -327,6 +327,8 @@ Benchmark matrix містить ASCII і UTF-8 книги розміром 1 MB,
 
 GitHub Actions workflow у `.github/workflows/ci.yml` запускається на `windows-latest` і перевіряє форматування, OpenAPI contract, актуальність згенерованих DTO, модулі, тести, race detector, `go vet`, `staticcheck`, `govulncheck` та збірку.
 
+Окремий playback stress gate 30 разів запускає `internal/playback` та `internal/events` під race detector і перевіряє state/active invariants, single-owner finalization та порядок terminal SSE events.
+
 Release workflow у `.github/workflows/release.yml` запускається на tags `v*`, збирає `tts-reader-windows-amd64.exe`, створює SHA256 checksum і публікує обидва артефакти в GitHub Release.
 
 ## Файли користувача

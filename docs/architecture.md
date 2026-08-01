@@ -89,10 +89,10 @@ Root package лишається application layer:
 
 ### Stop
 
-- `Stop` скасовує session context.
-- Далі `PlaybackManager` чекає завершення `session.done`.
-- Після цього прогрес зберігається, активна сесія очищається, а стан стає `stopped`.
-- Якщо `Stop` не дочекався завершення до timeout, стан лишається `stopping`, новий `Start` блокується, а фонове завершення старої goroutine переводить стан у `stopped`.
+- `Stop` переводить сесію у `stopping`, скасовує session context і викликає `TTSEngine.Stop(...)` лише один раз.
+- `Stop` не очищає `active` і не створює terminal snapshot: цим одноосібно володіє session finalizer.
+- Finalizer зберігає durable position, атомарно очищає `active`, встановлює `lastErr`, формує snapshot і публікує `playback.stopped`.
+- Якщо `Stop` не дочекався завершення до timeout, він повертає transient `ErrStopping` і не змінює сесію повторно; після фактичного завершення goroutine finalizer переводить стан у `stopped` без timeout-помилки.
 
 ## Як закриваються SSE-клієнти
 
@@ -103,6 +103,7 @@ Root package лишається application layer:
 - Для коректного завершення сервера `BaseContext` від `http.Server` скасовується через `cancelServe()`, тому відкриті SSE-запити виходять без зависання shutdown.
 - Кожна подія має monotonic `seq`, який також записується як SSE `id`.
 - Новий SSE клієнт одразу отримує `playback.snapshot` з актуальним станом.
+- Зміна playback state, створення snapshot і передача події broker виконуються під одним `PlaybackManager.mu`, тому подія зі старим active state не може отримати sequence після `playback.stopping`.
 - `chunk.started` і `progress.updated` є best-effort подіями, тому їх можна пропустити при backpressure.
 - Lifecycle-події не відкидаються мовчки: якщо клієнт не встигає читати і його канал переповнений, broker закриває цей клієнт, після чого браузерний `EventSource` перепідключається та отримує новий snapshot.
 - SSE handler періодично надсилає heartbeat comments, щоб довге з'єднання не виглядало мертвим для клієнта або проміжного proxy.

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -68,6 +69,10 @@ func TestPowerShellCommandErrorIncludesStderr(t *testing.T) {
 }
 
 func TestWindowsSAPIVoiceDiscoverySmoke(t *testing.T) {
+	if os.Getenv("RUN_WINDOWS_SAPI_SMOKE") != "1" {
+		t.Skip("встановіть RUN_WINDOWS_SAPI_SMOKE=1 для перевірки SAPI у Windows Desktop-сесії")
+	}
+
 	if _, err := listVoices(); err != nil {
 		t.Fatalf("Windows SAPI smoke test failed: %v", err)
 	}
