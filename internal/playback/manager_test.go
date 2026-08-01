@@ -53,10 +53,10 @@ func TestPlaybackManagerIgnoresStaleSessionFailure(t *testing.T) {
 	}
 	manager := NewManager(engines, time.Second, NewEventBroker())
 
-	firstPath = writeTempBook(t, "Перша книга.")
-	secondPath = writeTempBook(t, "Друга книга.")
-	firstBook := mustBook(t, firstPath)
-	secondBook := mustBook(t, secondPath)
+	firstBook := mustBook(t, writeTempBook(t, "Перша книга."))
+	secondBook := mustBook(t, writeTempBook(t, "Друга книга."))
+	firstPath = firstBook.Path
+	secondPath = secondBook.Path
 
 	if _, err := manager.Start(firstBook, StartRequest{
 		BookID:    firstBook.ID,
