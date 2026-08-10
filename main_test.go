@@ -290,6 +290,41 @@ func TestRunPersistsCompletedStreamingPositionOnSecondChunkFailure(t *testing.T)
 	assertSavedPosition(t, save, int64(len("Перший.")))
 }
 
+func TestRunDoesNotResetProgressWhenBookChangesDuringPlayback(t *testing.T) {
+	dir := t.TempDir()
+	book := filepath.Join(dir, "book.txt")
+	save := filepath.Join(dir, "save.json")
+	mustWriteFile(t, book, strings.Repeat("Фрагмент тексту. ", 400))
+
+	firstChunk := true
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", book, "-save", save, "-chunk", "32"}, &stdout, &stderr, testSpeaker(func(text string) error {
+		if firstChunk {
+			firstChunk = false
+			return os.Truncate(book, 0)
+		}
+		return nil
+	}), false)
+
+	if code != 1 {
+		t.Fatalf("очікував exit code 1 після зміни книги, отримав %d", code)
+	}
+	if !strings.Contains(stderr.String(), "змінено під час читання") {
+		t.Fatalf("очікував помилку зміни книги, stderr=%q", stderr.String())
+	}
+	data, err := os.ReadFile(save)
+	if err != nil {
+		t.Fatalf("не вдалося прочитати progress: %v", err)
+	}
+	var saved progresspkg.Progress
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("не вдалося декодувати progress: %v", err)
+	}
+	if saved.LastPosition <= 0 {
+		t.Fatalf("progress не має скидатися після зміни книги: %#v", saved)
+	}
+}
+
 func TestRunRejectsInvalidUTF8Book(t *testing.T) {
 	dir := t.TempDir()
 	book := filepath.Join(dir, "book.txt")

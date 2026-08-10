@@ -504,6 +504,7 @@ func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Boo
 	if err != nil {
 		return sessionResult{state: Failed, position: startPos, err: err}
 	}
+	durablePosition := startPos
 
 	for {
 		if !m.waitUntilPlayable(session) {
@@ -513,9 +514,19 @@ func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Boo
 		chunk, err := reader.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if err := validatePlaybackBookUnchanged(book); err != nil {
+					return sessionResult{state: Failed, position: durablePosition, err: err}
+				}
 				return sessionResult{state: Finished, position: book.Size}
 			}
 			return sessionResult{state: Failed, position: m.current(), err: err}
+		}
+		if chunk.EndByte > book.Size {
+			return sessionResult{
+				state:    Failed,
+				position: durablePosition,
+				err:      fmt.Errorf("%w: chunk ends past registered book size", bookpkg.ErrModified),
+			}
 		}
 
 		m.updateProgress(session.id, "chunk.started", chunk.StartByte)
@@ -532,8 +543,20 @@ func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Boo
 			return sessionResult{state: Failed, position: chunk.StartByte, err: fmt.Errorf("save progress: %w", err)}
 		}
 		m.markDurablePosition(session.id, chunk.EndByte)
+		durablePosition = chunk.EndByte
 		m.updateProgress(session.id, "progress.updated", chunk.EndByte)
 	}
+}
+
+func validatePlaybackBookUnchanged(book bookpkg.Book) error {
+	currentFile, err := bookpkg.InspectFile(book.Path)
+	if err != nil {
+		return fmt.Errorf("%w: revalidate book after playback: %v", bookpkg.ErrModified, err)
+	}
+	if !bookpkg.SameFile(book.File, currentFile) {
+		return fmt.Errorf("%w: book file changed during playback", bookpkg.ErrModified)
+	}
+	return nil
 }
 
 func (m *PlaybackManager) waitUntilPlayable(session *playbackSession) bool {
@@ -668,6 +691,9 @@ func (m *PlaybackManager) snapshotLocked() PlaybackSnapshot {
 func playbackErrorCode(err error) string {
 	if err == nil {
 		return ""
+	}
+	if errors.Is(err, bookpkg.ErrModified) {
+		return "book_modified"
 	}
 	if errors.Is(err, ErrStopping) {
 		return "playback_stopping"

@@ -415,7 +415,7 @@ components:
           minimum: 1
         error_code:
           type: string
-          enum: [internal_error, playback_stopping]
+          enum: [internal_error, playback_stopping, book_modified]
         error:
           type: string
 

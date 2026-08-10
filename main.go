@@ -134,19 +134,19 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 	fmt.Fprintln(stdout, "Ctrl+C для виходу.")
 	fmt.Fprintln(stdout, "------------------------------------------------")
 
-	book, err := os.Open(cfg.BookFile)
+	bookFile, err := os.Open(cfg.BookFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося відкрити файл книги %q: %v\n", cfg.BookFile, err)
 		return 1
 	}
-	defer book.Close()
+	defer bookFile.Close()
 
-	if _, err := book.Seek(startPos, io.SeekStart); err != nil {
+	if _, err := bookFile.Seek(startPos, io.SeekStart); err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося перейти до позиції %d bytes у книзі: %v\n", startPos, err)
 		return 1
 	}
 
-	reader, err := chunk.NewStreamingReader(book, startPos, cfg.ChunkSize)
+	reader, err := chunk.NewStreamingReader(bookFile, startPos, cfg.ChunkSize)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: %v\n", err)
 		return 1
@@ -169,6 +169,14 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 			}
 			return 1
 		}
+		if chunk.EndByte > bookSize {
+			pos := app.pos.Load()
+			fmt.Fprintln(stderr, "\n[ПОМИЛКА КНИГИ] Файл книги змінено під час читання: фрагмент виходить за початковий розмір")
+			if saveErr := app.saveProgress(pos); saveErr != nil {
+				fmt.Fprintf(stderr, "Помилка: не вдалося зберегти прогрес після зміни книги: %v\n", saveErr)
+			}
+			return 1
+		}
 
 		app.pos.Store(chunk.StartByte)
 		if err := app.speaker(app.ctx, chunk.Text); err != nil {
@@ -188,6 +196,20 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 			fmt.Fprintf(stderr, "Помилка: не вдалося записати прогрес: %v\n", err)
 			return 1
 		}
+	}
+
+	currentBook, err := book.InspectFile(cfg.BookFile)
+	if err != nil || !book.SameFile(app.book, currentBook) {
+		pos := app.pos.Load()
+		if err != nil {
+			fmt.Fprintf(stderr, "\n[ПОМИЛКА КНИГИ] Не вдалося перевірити файл після читання: %v\n", err)
+		} else {
+			fmt.Fprintln(stderr, "\n[ПОМИЛКА КНИГИ] Файл книги змінено під час читання")
+		}
+		if saveErr := app.saveProgress(pos); saveErr != nil {
+			fmt.Fprintf(stderr, "Помилка: не вдалося зберегти прогрес після зміни книги: %v\n", saveErr)
+		}
+		return 1
 	}
 
 	if err := app.saveProgress(0); err != nil {

@@ -417,6 +417,8 @@ func publicErrorMessageForCode(code string) string {
 	switch code {
 	case "playback_stopping":
 		return "playback is still stopping"
+	case "book_modified":
+		return "book file changed during playback"
 	case "internal_error":
 		return "internal server error"
 	default:

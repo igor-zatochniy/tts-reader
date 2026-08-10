@@ -54,6 +54,7 @@ func (e PlaybackEventType) Valid() bool {
 
 // Defines values for PlaybackStateErrorCode.
 const (
+	PlaybackStateErrorCodeBookModified     PlaybackStateErrorCode = "book_modified"
 	PlaybackStateErrorCodeInternalError    PlaybackStateErrorCode = "internal_error"
 	PlaybackStateErrorCodePlaybackStopping PlaybackStateErrorCode = "playback_stopping"
 )
@@ -61,6 +62,8 @@ const (
 // Valid indicates whether the value is a known member of the PlaybackStateErrorCode enum.
 func (e PlaybackStateErrorCode) Valid() bool {
 	switch e {
+	case PlaybackStateErrorCodeBookModified:
+		return true
 	case PlaybackStateErrorCodeInternalError:
 		return true
 	case PlaybackStateErrorCodePlaybackStopping:

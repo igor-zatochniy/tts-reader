@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,6 +104,104 @@ func TestPlaybackManagerIgnoresStaleSessionFailure(t *testing.T) {
 
 	close(secondRelease)
 	waitState(t, manager, Finished)
+}
+
+func TestPlaybackRejectsTruncatedBookDuringPlayback(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var firstSpeak sync.Once
+	store := &trackingProgressStore{}
+	manager := NewManagerWithProgress(
+		func(tts.Config) tts.Engine {
+			return &testEngine{speakContext: func(ctx context.Context, text string) error {
+				firstSpeak.Do(func() {
+					started <- struct{}{}
+					<-release
+				})
+				return nil
+			}}
+		},
+		time.Second,
+		NewEventBroker(),
+		store,
+	)
+	registeredBook := mustBook(t, writeTempBook(t, strings.Repeat("Фрагмент тексту. ", 400)))
+
+	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID, ChunkSize: intPtr(32)}); err != nil {
+		t.Fatalf("не вдалося запустити playback: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("playback не стартував")
+	}
+	if err := os.Truncate(registeredBook.Path, 0); err != nil {
+		close(release)
+		t.Fatalf("не вдалося скоротити книгу: %v", err)
+	}
+	close(release)
+
+	snapshot := waitState(t, manager, Failed)
+	if snapshot.ErrorCode != "book_modified" {
+		t.Fatalf("очікував book_modified, отримав %#v", snapshot)
+	}
+	if saved := store.lastSavedPosition(); saved <= 0 {
+		t.Fatalf("прогрес не має скидатися після скорочення книги: %d", saved)
+	}
+}
+
+func TestPlaybackRejectsAppendedContentPastRegisteredSize(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var firstSpeak sync.Once
+	store := &trackingProgressStore{}
+	manager := NewManagerWithProgress(
+		func(tts.Config) tts.Engine {
+			return &testEngine{speakContext: func(ctx context.Context, text string) error {
+				firstSpeak.Do(func() {
+					started <- struct{}{}
+					<-release
+				})
+				return nil
+			}}
+		},
+		time.Second,
+		NewEventBroker(),
+		store,
+	)
+	registeredBook := mustBook(t, writeTempBook(t, strings.Repeat("Початковий текст. ", 20)))
+
+	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID, ChunkSize: intPtr(16)}); err != nil {
+		t.Fatalf("не вдалося запустити playback: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("playback не стартував")
+	}
+	file, err := os.OpenFile(registeredBook.Path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		close(release)
+		t.Fatalf("не вдалося відкрити книгу для доповнення: %v", err)
+	}
+	if _, err := file.WriteString(strings.Repeat(" Доданий текст.", 100)); err != nil {
+		_ = file.Close()
+		close(release)
+		t.Fatalf("не вдалося доповнити книгу: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		close(release)
+		t.Fatalf("не вдалося закрити доповнену книгу: %v", err)
+	}
+	close(release)
+
+	snapshot := waitState(t, manager, Failed)
+	if snapshot.ErrorCode != "book_modified" {
+		t.Fatalf("очікував book_modified, отримав %#v", snapshot)
+	}
+	if snapshot.CurrentByte > registeredBook.Size || snapshot.ProgressPercent > 100 {
+		t.Fatalf("progress вийшов за початковий розмір книги: %#v size=%d", snapshot, registeredBook.Size)
+	}
 }
 
 func TestPlaybackStopTimeoutFinalizesWithoutTransientError(t *testing.T) {
