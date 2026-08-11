@@ -80,6 +80,9 @@ func TestLocalAPIServesDashboard(t *testing.T) {
 	if strings.Contains(rec.Body.String(), ".innerHTML") || !strings.Contains(rec.Body.String(), "option.textContent = voice") {
 		t.Fatalf("dashboard має створювати voice options через безпечний DOM API")
 	}
+	if !strings.Contains(rec.Body.String(), "maxEventLogEntries = 300") || !strings.Contains(rec.Body.String(), "eventLog.length = maxEventLogEntries") {
+		t.Fatalf("dashboard має обмежувати історію SSE-подій")
+	}
 
 	rec = performJSON(t, api.Routes(), http.MethodGet, "/api/openapi.yaml", nil)
 	if rec.Code != http.StatusOK {
@@ -611,6 +614,20 @@ func TestLocalAPISecurityRejectsBadHostOriginAndMissingToken(t *testing.T) {
 	api.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("очікував 403 для bad Origin, отримав %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLocalAPIRequiresTokenBeforeVoiceDiscovery(t *testing.T) {
+	engineCreations := 0
+	api := newTestLocalAPIWithEngineFactory(t, func(tts.Config) tts.Engine {
+		engineCreations++
+		return &testEngine{}
+	})
+
+	rec := performJSONWithoutToken(t, api.Routes(), http.MethodGet, "/api/v1/voices", nil)
+	assertErrorCode(t, rec, http.StatusUnauthorized, "api_token_required")
+	if engineCreations != 0 {
+		t.Fatalf("voice discovery створив TTS engine до token-перевірки: %d", engineCreations)
 	}
 }
 

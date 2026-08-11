@@ -117,6 +117,7 @@ type playbackSession struct {
 	cancel        context.CancelFunc
 	done          chan struct{}
 	engine        TTSEngine
+	progressLease *progress.Lease
 	stopDone      chan struct{}
 	stopStarted   bool
 	stopFinished  bool
@@ -217,6 +218,16 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 	if err != nil {
 		return PlaybackSnapshot{}, err
 	}
+	m.mu.Lock()
+	if m.state == Stopping {
+		m.mu.Unlock()
+		return PlaybackSnapshot{}, ErrStopping
+	}
+	if m.active != nil || m.state == Playing || m.state == Paused {
+		m.mu.Unlock()
+		return PlaybackSnapshot{}, ErrActive
+	}
+	m.mu.Unlock()
 
 	currentFile, err := bookpkg.InspectFile(book.Path)
 	if err != nil {
@@ -227,6 +238,17 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 	}
 	book.Size = currentFile.Size
 	book.File = currentFile
+
+	progressLease, err := progress.AcquireLease(book.SaveFile)
+	if err != nil {
+		return PlaybackSnapshot{}, err
+	}
+	leaseOwned := true
+	defer func() {
+		if leaseOwned {
+			_ = progressLease.Close()
+		}
+	}()
 
 	startPos, err := m.progress.Load(book, currentFile.Size)
 	if err != nil {
@@ -263,12 +285,13 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 	}
 	m.nextID++
 	session := &playbackSession{
-		id:       m.nextID,
-		ctx:      ctx,
-		cancel:   cancel,
-		done:     make(chan struct{}),
-		engine:   engine,
-		stopDone: make(chan struct{}),
+		id:            m.nextID,
+		ctx:           ctx,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		engine:        engine,
+		progressLease: progressLease,
+		stopDone:      make(chan struct{}),
 	}
 	m.state = Playing
 	m.book = book
@@ -281,6 +304,7 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 	m.active = session
 	snapshot := m.publishLocked("playback.started")
 	m.mu.Unlock()
+	leaseOwned = false
 
 	go m.play(session, book, startPos, chunkSize)
 	return snapshot, nil
@@ -446,6 +470,11 @@ func (m *PlaybackManager) SetPosition(book bookpkg.Book, pos int64) (PlaybackSna
 	if !ok {
 		return PlaybackSnapshot{}, progress.ErrPositionInside
 	}
+	progressLease, err := progress.AcquireLease(book.SaveFile)
+	if err != nil {
+		return PlaybackSnapshot{}, err
+	}
+	defer progressLease.Close()
 	if err := m.progress.Save(book, pos); err != nil {
 		return PlaybackSnapshot{}, fmt.Errorf("save position: %w", err)
 	}
@@ -484,9 +513,10 @@ func (m *PlaybackManager) SubscribeEvents() (<-chan PlaybackEvent, func()) {
 }
 
 func (m *PlaybackManager) play(session *playbackSession, book bookpkg.Book, startPos int64, chunkSize int) {
+	defer close(session.done)
+	defer session.progressLease.Close()
 	result := m.runPlayback(session, book, startPos, chunkSize)
 	m.finalizeSession(session, book, result)
-	close(session.done)
 }
 
 func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Book, startPos int64, chunkSize int) sessionResult {
@@ -647,6 +677,11 @@ func (m *PlaybackManager) finalizeSession(session *playbackSession, book bookpkg
 		m.currentByte = position
 		m.currentChunkStart = position
 		eventType = "playback.stopped"
+	}
+	if err := session.progressLease.Close(); err != nil {
+		finalErr = errors.Join(finalErr, err)
+		m.state = Failed
+		eventType = "playback.failed"
 	}
 
 	m.lastErr = finalErr

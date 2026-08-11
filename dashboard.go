@@ -78,6 +78,8 @@ const localDashboardHTML = `<!doctype html>
 </main>
 <script>
 let currentBookId = "";
+const maxEventLogEntries = 300;
+const eventLog = [];
 const $ = (id) => document.getElementById(id);
 const apiToken = new URLSearchParams(location.search).get("token") || "";
 if (apiToken) {
@@ -106,7 +108,9 @@ function render(snapshot) {
 
 function log(line) {
   const box = $("events");
-  box.textContent = new Date().toLocaleTimeString() + "  " + line + "\n" + box.textContent;
+  eventLog.unshift(new Date().toLocaleTimeString() + "  " + line);
+  if (eventLog.length > maxEventLogEntries) eventLog.length = maxEventLogEntries;
+  box.textContent = eventLog.join("\n");
 }
 
 async function refreshState() {

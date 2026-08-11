@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Audiobook TTS Reader Local API
   version: 1.0.0
-  description: Local loopback API for controlling Windows SAPI audiobook playback. Mutating requests require the per-run API token printed by `tts-reader serve`.
+  description: Local loopback API for controlling Windows SAPI audiobook playback. Mutating requests, voice discovery and event streaming require the per-run API token printed by `tts-reader serve`.
 servers:
   - url: http://127.0.0.1:8080
 tags:
@@ -36,7 +36,8 @@ paths:
       tags: [Voices]
       operationId: listVoices
       summary: List installed Windows SAPI voices
-      security: []
+      security:
+        - ApiTokenHeader: []
       responses:
         "200":
           description: Installed voices
@@ -45,6 +46,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/VoicesResponse"
         "403":
+          $ref: "#/components/responses/Error"
+        "401":
           $ref: "#/components/responses/Error"
         "500":
           $ref: "#/components/responses/Error"

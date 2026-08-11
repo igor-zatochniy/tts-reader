@@ -204,6 +204,130 @@ func TestPlaybackRejectsAppendedContentPastRegisteredSize(t *testing.T) {
 	}
 }
 
+func TestPlaybackRejectsSameSizeMiddleEditDuringPlayback(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var firstSpeak sync.Once
+	store := &trackingProgressStore{}
+	manager := NewManagerWithProgress(
+		func(tts.Config) tts.Engine {
+			return &testEngine{speakContext: func(ctx context.Context, text string) error {
+				firstSpeak.Do(func() {
+					started <- struct{}{}
+					<-release
+				})
+				return nil
+			}}
+		},
+		time.Second,
+		NewEventBroker(),
+		store,
+	)
+	registeredBook := mustBook(t, writeTempBook(t, strings.Repeat("a", 256<<10)))
+
+	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID, ChunkSize: intPtr(10000)}); err != nil {
+		t.Fatalf("не вдалося запустити playback: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("playback не стартував")
+	}
+	file, err := os.OpenFile(registeredBook.Path, os.O_WRONLY, 0)
+	if err != nil {
+		close(release)
+		t.Fatalf("не вдалося відкрити книгу для зміни: %v", err)
+	}
+	if _, err := file.WriteAt([]byte("changed-middle"), 128<<10); err != nil {
+		_ = file.Close()
+		close(release)
+		t.Fatalf("не вдалося змінити середину книги: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		close(release)
+		t.Fatalf("не вдалося закрити змінену книгу: %v", err)
+	}
+	changedTime := registeredBook.File.ModifiedAt.Add(2 * time.Second)
+	if err := os.Chtimes(registeredBook.Path, changedTime, changedTime); err != nil {
+		close(release)
+		t.Fatalf("не вдалося змінити modification time книги: %v", err)
+	}
+	close(release)
+
+	snapshot := waitState(t, manager, Failed)
+	if snapshot.ErrorCode != "book_modified" {
+		t.Fatalf("очікував book_modified, отримав %#v", snapshot)
+	}
+	if saved := store.lastSavedPosition(); saved <= 0 {
+		t.Fatalf("progress не має скидатися після middle edit: %d", saved)
+	}
+}
+
+func TestPlaybackLeaseBlocksSecondManagerUntilSessionStops(t *testing.T) {
+	started := make(chan struct{}, 1)
+	firstManager := NewManager(
+		func(tts.Config) tts.Engine {
+			return &testEngine{speakContext: func(ctx context.Context, text string) error {
+				started <- struct{}{}
+				<-ctx.Done()
+				return ctx.Err()
+			}}
+		},
+		time.Second,
+		NewEventBroker(),
+	)
+	secondManager := NewManager(
+		func(tts.Config) tts.Engine { return &testEngine{} },
+		time.Second,
+		NewEventBroker(),
+	)
+	registeredBook := mustBook(t, writeTempBook(t, "Книга з одним фрагментом."))
+
+	if _, err := firstManager.Start(registeredBook, StartRequest{BookID: registeredBook.ID}); err != nil {
+		t.Fatalf("не вдалося запустити перший manager: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("перша playback-сесія не стартувала")
+	}
+	if _, err := secondManager.Start(registeredBook, StartRequest{BookID: registeredBook.ID}); !errors.Is(err, progress.ErrInUse) {
+		t.Fatalf("очікував ErrInUse для другого manager, отримав %v", err)
+	}
+
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelStop()
+	if _, err := firstManager.Stop(stopCtx); err != nil {
+		t.Fatalf("не вдалося зупинити перший manager: %v", err)
+	}
+	if _, err := secondManager.Start(registeredBook, StartRequest{BookID: registeredBook.ID}); err != nil {
+		t.Fatalf("lease не звільнився після Stop: %v", err)
+	}
+	waitState(t, secondManager, Finished)
+}
+
+func TestFinishedStateIsPublishedAfterProgressLeaseRelease(t *testing.T) {
+	manager := NewManager(
+		func(tts.Config) tts.Engine { return &testEngine{} },
+		time.Second,
+		NewEventBroker(),
+	)
+	registeredBook := mustBook(t, writeTempBook(t, "Книга."))
+
+	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID}); err != nil {
+		t.Fatalf("не вдалося запустити playback: %v", err)
+	}
+	waitState(t, manager, Finished)
+
+	lease, err := progress.AcquireLease(registeredBook.SaveFile)
+	if err != nil {
+		t.Fatalf("finished опубліковано до звільнення progress lease: %v", err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatalf("не вдалося звільнити контрольний lease: %v", err)
+	}
+}
+
 func TestPlaybackStopTimeoutFinalizesWithoutTransientError(t *testing.T) {
 	started := make(chan struct{}, 1)
 	releaseSpeak := make(chan struct{})
@@ -964,7 +1088,7 @@ func assertSavedPosition(t *testing.T, path string, want int64) {
 	if got.PositionUnit != progress.Unit {
 		t.Fatalf("очікував position_unit %q, отримав %q", progress.Unit, got.PositionUnit)
 	}
-	if got.BookSize < 0 || got.BookFingerprint == "" {
+	if got.BookSize < 0 || got.BookModifiedAtUnixNano == 0 || got.BookFingerprint == "" {
 		t.Fatalf("progress не прив'язаний до книги: %#v", got)
 	}
 }

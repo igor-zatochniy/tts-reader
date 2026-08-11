@@ -105,7 +105,7 @@ func FuzzProgressLoad(f *testing.F) {
 	f.Add([]byte("Hello, world!"), mustProgressJSON(f, progressSeedForData([]byte("Hello, world!"), 0)))
 	f.Add([]byte("Аудіо"), mustProgressJSON(f, progressSeedForData([]byte("Аудіо"), 2)))
 	f.Add([]byte("Аудіо"), mustProgressJSON(f, progressSeedForData([]byte("Аудіо"), 1)))
-	f.Add([]byte("Hello"), []byte(`{"version":2,"last_position":-1,"position_unit":"bytes (UTF-8)"}`))
+	f.Add([]byte("Hello"), []byte(`{"version":3,"last_position":-1,"position_unit":"bytes (UTF-8)"}`))
 	f.Add([]byte("Hello"), []byte(`not-json`))
 
 	f.Fuzz(func(t *testing.T, bookData []byte, progressData []byte) {

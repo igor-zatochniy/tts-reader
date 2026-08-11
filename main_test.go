@@ -159,6 +159,27 @@ func TestDefaultProgressPathUsesSeparateHashedFiles(t *testing.T) {
 	}
 }
 
+func TestRunRejectsProgressFileUsedByAnotherProcess(t *testing.T) {
+	dir := t.TempDir()
+	book := filepath.Join(dir, "book.txt")
+	save := filepath.Join(dir, "progress.json")
+	mustWriteFile(t, book, "Книга.")
+	lease, err := progresspkg.AcquireLease(save)
+	if err != nil {
+		t.Fatalf("не вдалося підготувати progress lease: %v", err)
+	}
+	defer lease.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", book, "-save", save}, &stdout, &stderr, testSpeaker(nil), false)
+	if code != 1 {
+		t.Fatalf("очікував exit code 1 для зайнятого progress, отримав %d", code)
+	}
+	if !strings.Contains(stderr.String(), "вже використовується іншим процесом") {
+		t.Fatalf("очікував повідомлення про зайнятий progress, stderr=%q", stderr.String())
+	}
+}
+
 func TestWriteFileReplaceReplacesProgressAndCleansTemp(t *testing.T) {
 	dir := t.TempDir()
 	save := filepath.Join(dir, "book_save.json")
@@ -512,7 +533,7 @@ func assertSavedPosition(t *testing.T, path string, want int64) {
 	if got.PositionUnit != progresspkg.Unit {
 		t.Fatalf("очікував position_unit %q, отримав %q", progresspkg.Unit, got.PositionUnit)
 	}
-	if got.BookSize < 0 || got.BookFingerprint == "" {
+	if got.BookSize < 0 || got.BookModifiedAtUnixNano == 0 || got.BookFingerprint == "" {
 		t.Fatalf("progress не прив'язаний до книги: %#v", got)
 	}
 }

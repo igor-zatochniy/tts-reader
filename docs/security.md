@@ -37,8 +37,8 @@
 
 ### API token
 
-- Для state-changing запитів використовується token.
-- State-changing endpoints приймають token тільки через `X-TTS-Token`.
+- Для state-changing запитів і дорогого voice discovery використовується token.
+- State-changing endpoints та `GET /api/v1/voices` приймають token тільки через `X-TTS-Token`.
 - Query token дозволений лише для `GET /api/v1/events`, оскільки browser `EventSource` не підтримує custom headers.
 - Після завантаження сторінки токен прибирається з адресного рядка через `history.replaceState(...)`.
 
@@ -75,8 +75,9 @@
 ### Progress file
 
 - Progress записується локально в JSON.
-- Progress прив'язаний до конкретної книги через version, size і fingerprint.
+- Progress прив'язаний до конкретної книги через version, size, modification time і fingerprint.
 - Використовується атомарна заміна файла.
+- Міжпроцесний lease утримується протягом усієї CLI або API playback-сесії, тому два процеси не можуть відкотити позицію один одного.
 - Тимчасовий файл не має бути кінцевим джерелом істини.
 
 ### Windows TTS

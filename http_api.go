@@ -51,7 +51,7 @@ func (api *LocalAPI) requiresToken(r *http.Request) bool {
 	if api.token == "" {
 		return false
 	}
-	if r.URL.Path == "/api/v1/events" {
+	if r.URL.Path == "/api/v1/events" || r.URL.Path == "/api/v1/voices" {
 		return true
 	}
 	return changesState(r.Method)
@@ -444,6 +444,8 @@ func publicErrorMessageForError(err error) string {
 		return "progress belongs to a different book"
 	case errors.Is(err, progress.ErrFormat):
 		return "unsupported progress format"
+	case errors.Is(err, progress.ErrInUse):
+		return "progress is already in use"
 	case errors.Is(err, book.ErrNotFound):
 		return "book not found"
 	case errors.Is(err, book.ErrNotReadable):
@@ -485,6 +487,7 @@ func statusForError(err error) int {
 		errors.Is(err, book.ErrModified),
 		errors.Is(err, progress.ErrBookMismatch),
 		errors.Is(err, progress.ErrFormat),
+		errors.Is(err, progress.ErrInUse),
 		errors.Is(err, playback.ErrNotPlaying),
 		errors.Is(err, playback.ErrNotPaused):
 		return http.StatusConflict
@@ -527,6 +530,8 @@ func codeForError(err error) string {
 		return "progress_book_mismatch"
 	case errors.Is(err, progress.ErrFormat):
 		return "progress_format_unsupported"
+	case errors.Is(err, progress.ErrInUse):
+		return "progress_in_use"
 	case errors.Is(err, book.ErrNotFound):
 		return "book_not_found"
 	case errors.Is(err, book.ErrNotReadable):

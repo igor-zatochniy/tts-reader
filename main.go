@@ -61,6 +61,16 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 		fmt.Fprintf(stderr, "Помилка: %v\n", err)
 		return 2
 	}
+	progressLease, err := progress.AcquireLease(cfg.SaveFile)
+	if err != nil {
+		if errors.Is(err, progress.ErrInUse) {
+			fmt.Fprintf(stderr, "Помилка: файл прогресу вже використовується іншим процесом: %s\n", cfg.SaveFile)
+		} else {
+			fmt.Fprintf(stderr, "Помилка: не вдалося заблокувати файл прогресу %q: %v\n", cfg.SaveFile, err)
+		}
+		return 1
+	}
+	defer progressLease.Close()
 
 	ctx := context.Background()
 	cleanupSignals := func() {}

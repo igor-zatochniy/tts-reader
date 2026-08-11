@@ -29,7 +29,7 @@ flowchart LR
 
 - `internal/book` відповідає за модель книги, in-memory registry, абсолютні шляхи та file identity checks.
 - `internal/chunk` містить streaming reader, smart chunk boundaries, UTF-8 byte-boundary helpers і пошук стартової фрази.
-- `internal/progress` відповідає за JSON progress format, прив'язку progress до книги й атомарну заміну progress-файла.
+- `internal/progress` відповідає за JSON progress format, прив'язку progress до книги, міжпроцесний lease й атомарну заміну progress-файла.
 - `internal/tts` містить TTS interfaces, voice model і function-based engine adapter.
 - `internal/events` містить generic event broker з backpressure policy.
 - `internal/playback` збирає book, chunk, progress, tts та events у playback state machine.
@@ -123,7 +123,8 @@ Root package лишається application layer:
 
 - `ProgressStore.Save(...)` пише JSON у user cache (`%LOCALAPPDATA%\tts-reader\progress` на Windows) за SHA-256 канонічного book path;
 - атомарна заміна файла використовується, щоб не отримати напівзаписаний progress;
-- `Load(...)` перевіряє version, UTF-8 межі, розмір поточного файла і fingerprint книги, щоб progress не можна було випадково застосувати до іншого тексту.
+- CLI або playback session утримує міжпроцесний lease до фінального запису, тому для однієї книги завжди є лише один writer;
+- `Load(...)` перевіряє version, UTF-8 межі, розмір, modification time і fingerprint книги, щоб progress не можна було випадково застосувати до іншого тексту.
 
 ## Чому позиція вимірюється в байтах
 
