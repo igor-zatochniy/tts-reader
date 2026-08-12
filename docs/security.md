@@ -40,6 +40,7 @@
 - Для state-changing запитів і дорогого voice discovery використовується token.
 - State-changing endpoints та `GET /api/v1/voices` приймають token тільки через `X-TTS-Token`.
 - Query token дозволений лише для `GET /api/v1/events`, оскільки browser `EventSource` не підтримує custom headers.
+- Dashboard зберігає query token у `sessionStorage`, відновлює його після refresh і не переносить між незалежними browser sessions.
 - Після завантаження сторінки токен прибирається з адресного рядка через `history.replaceState(...)`.
 
 ### Безпечні HTTP-помилки
@@ -75,7 +76,7 @@
 ### Progress file
 
 - Progress записується локально в JSON.
-- Progress прив'язаний до конкретної книги через version, size, modification time і fingerprint.
+- Progress прив'язаний до конкретної книги через version, size, modification time і повний streaming SHA-256 fingerprint.
 - Використовується атомарна заміна файла.
 - Міжпроцесний lease утримується протягом усієї CLI або API playback-сесії, тому два процеси не можуть відкотити позицію один одного.
 - Тимчасовий файл не має бути кінцевим джерелом істини.

@@ -185,27 +185,21 @@ func InspectFile(path string) (FileIdentity, error) {
 	}
 
 	hash := sha256.New()
-	fmt.Fprintf(hash, "size:%d\n", info.Size())
-
-	const sampleSize int64 = 64 << 10
-	headSize := minInt64(info.Size(), sampleSize)
-	if headSize > 0 {
-		if _, err := io.CopyN(hash, file, headSize); err != nil {
-			return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
-		}
+	bytesRead, err := io.Copy(hash, file)
+	if err != nil {
+		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
-	if info.Size() > sampleSize {
-		if _, err := file.Seek(info.Size()-sampleSize, io.SeekStart); err != nil {
-			return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
-		}
-		if _, err := io.CopyN(hash, file, sampleSize); err != nil {
-			return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
-		}
+	afterRead, err := file.Stat()
+	if err != nil {
+		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
+	}
+	if bytesRead != info.Size() || afterRead.Size() != info.Size() || !afterRead.ModTime().Equal(info.ModTime()) {
+		return FileIdentity{}, fmt.Errorf("%w: file changed while calculating fingerprint", ErrModified)
 	}
 
 	return FileIdentity{
 		Size:        info.Size(),
-		ModifiedAt:  info.ModTime().UTC(),
+		ModifiedAt:  afterRead.ModTime().UTC(),
 		Fingerprint: hex.EncodeToString(hash.Sum(nil)),
 	}, nil
 }
@@ -214,11 +208,4 @@ func SameFile(registered FileIdentity, current FileIdentity) bool {
 	return registered.Size == current.Size &&
 		registered.ModifiedAt.Equal(current.ModifiedAt) &&
 		registered.Fingerprint == current.Fingerprint
-}
-
-func minInt64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -13,7 +13,7 @@
 - Потокове читання книги через `StreamingChunkReader` без попереднього розбиття всього файлу в пам'яті.
 - Розбиття тексту на фрагменти з урахуванням UTF-8, byte-offset прогресу і меж речень.
 - Збереження прогресу після кожного фрагмента, при TTS-помилці та при `Ctrl+C`.
-- Прив'язка progress-файлу до конкретної книги через version, book size, modification time і sampled SHA-256 fingerprint.
+- Прив'язка progress-файлу до конкретної книги через version, book size, modification time і повний streaming SHA-256 fingerprint.
 - Міжпроцесний lease не дозволяє двом екземплярам застосунку одночасно перезаписувати progress однієї книги.
 - Зберігання progress за замовчуванням у user cache (`%LOCALAPPDATA%\tts-reader\progress` на Windows), а не поруч із книгою.
 - Валідація файлу прогресу, `-chunk`, `-tts-timeout` і UTF-8 меж перед відновленням читання.
@@ -145,9 +145,10 @@ Security model:
 - HTTP server приймає тільки loopback bind, наприклад `127.0.0.1:8080` або `localhost:8080`.
 - Middleware перевіряє `Host` і `Origin`, щоб стороння browser-сторінка не могла керувати локальним TTS service.
 - `POST`, `PUT`, `PATCH`, `DELETE` і дорогий `GET /api/v1/voices` потребують token через `X-TTS-Token`; query token дозволений тільки для browser dashboard SSE-з'єднання `GET /api/v1/events`.
+- Dashboard переносить query token у `sessionStorage`, прибирає його з адресного рядка та відновлює після refresh у межах поточної browser session.
 - HTTP API не приймає `save_file` і не повертає абсолютні filesystem paths; progress-файл є внутрішньою деталлю застосунку.
 - Повторна реєстрація того самого канонічного book path повертає наявний `book_id` і оновлює файлові метадані без дублювання запису.
-- Книга стартує тільки якщо файл не змінився після реєстрації: перевіряються size, modification time і sampled SHA-256 fingerprint.
+- Книга стартує тільки якщо файл не змінився після реєстрації: перевіряються size, modification time і повний streaming SHA-256 fingerprint.
 - Progress відновлюється тільки якщо JSON належить цій самій книзі: перевіряються version, position unit, book size, modification time і book fingerprint.
 - Progress-файл має одного writer: CLI або playback session утримує міжпроцесний lease до остаточного збереження позиції.
 - Помилки API повертаються у структурованому форматі `{ "code": "...", "error": "..." }`; `Stop` повертає playback snapshot навіть якщо progress не вдалося зберегти.
@@ -243,7 +244,7 @@ position.updated
 
 Щоб продовжити читання зі старого progress-файлу, створеного поруч із книгою, передай його явно через `-save`.
 
-Progress formats до v3 не відновлюються автоматично: вони не містять modification time і тому відхиляються fail-closed як недостатньо прив'язані до поточного файла книги.
+Progress formats до v4 не відновлюються автоматично: попередні версії не містять усіх актуальних identity guarantees і тому відхиляються fail-closed як недостатньо прив'язані до поточного файла книги.
 
 ## Перевірки
 

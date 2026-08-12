@@ -77,6 +77,11 @@ func TestLocalAPIServesDashboard(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `history.replaceState({}, document.title, "/")`) {
 		t.Fatalf("dashboard не прибирає token з адресного рядка")
 	}
+	if !strings.Contains(rec.Body.String(), "sessionStorage.setItem(tokenStorageKey, queryToken)") ||
+		!strings.Contains(rec.Body.String(), "sessionStorage.getItem(tokenStorageKey)") ||
+		!strings.Contains(rec.Body.String(), "const apiToken = queryToken || storedToken") {
+		t.Fatalf("dashboard не відновлює API token після refresh")
+	}
 	if strings.Contains(rec.Body.String(), ".innerHTML") || !strings.Contains(rec.Body.String(), "option.textContent = voice") {
 		t.Fatalf("dashboard має створювати voice options через безпечний DOM API")
 	}

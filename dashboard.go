@@ -81,10 +81,19 @@ let currentBookId = "";
 const maxEventLogEntries = 300;
 const eventLog = [];
 const $ = (id) => document.getElementById(id);
-const apiToken = new URLSearchParams(location.search).get("token") || "";
-if (apiToken) {
+const tokenStorageKey = "tts-reader-token";
+const queryToken = new URLSearchParams(location.search).get("token") || "";
+if (queryToken) {
+  try {
+    sessionStorage.setItem(tokenStorageKey, queryToken);
+  } catch {}
   history.replaceState({}, document.title, "/");
 }
+let storedToken = "";
+try {
+  storedToken = sessionStorage.getItem(tokenStorageKey) || "";
+} catch {}
+const apiToken = queryToken || storedToken;
 
 async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };

@@ -6,12 +6,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/igor-zatochniy/tts-reader/internal/book"
 )
 
-func TestValidateForBookRejectsSameSizeMiddleEdit(t *testing.T) {
+func TestValidateForBookRejectsSameSizeMiddleEditWithPreservedMtime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "book.txt")
 	content := make([]byte, 256<<10)
 	for i := range content {
@@ -38,17 +37,19 @@ func TestValidateForBookRejectsSameSizeMiddleEdit(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatalf("не вдалося закрити змінену книгу: %v", err)
 	}
-	changedTime := original.ModifiedAt.Add(2 * time.Second)
-	if err := os.Chtimes(path, changedTime, changedTime); err != nil {
-		t.Fatalf("не вдалося зафіксувати новий modification time: %v", err)
+	if err := os.Chtimes(path, original.ModifiedAt, original.ModifiedAt); err != nil {
+		t.Fatalf("не вдалося відновити modification time: %v", err)
 	}
 
 	current, err := book.InspectFile(path)
 	if err != nil {
 		t.Fatalf("не вдалося перевірити змінену книгу: %v", err)
 	}
-	if original.Fingerprint != current.Fingerprint {
-		t.Fatal("тест має змінювати лише область поза sampled fingerprint")
+	if !current.ModifiedAt.Equal(original.ModifiedAt) || current.Size != original.Size {
+		t.Fatalf("умови regression test порушені: original=%#v current=%#v", original, current)
+	}
+	if original.Fingerprint == current.Fingerprint {
+		t.Fatal("full fingerprint має виявляти зміну середини книги")
 	}
 	_, err = ValidateForBook(BookForProgress(path, "", current), saved, current.Size)
 	if !errors.Is(err, ErrBookMismatch) {

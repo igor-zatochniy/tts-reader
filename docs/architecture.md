@@ -124,7 +124,7 @@ Root package лишається application layer:
 - `ProgressStore.Save(...)` пише JSON у user cache (`%LOCALAPPDATA%\tts-reader\progress` на Windows) за SHA-256 канонічного book path;
 - атомарна заміна файла використовується, щоб не отримати напівзаписаний progress;
 - CLI або playback session утримує міжпроцесний lease до фінального запису, тому для однієї книги завжди є лише один writer;
-- `Load(...)` перевіряє version, UTF-8 межі, розмір, modification time і fingerprint книги, щоб progress не можна було випадково застосувати до іншого тексту.
+- `Load(...)` перевіряє version, UTF-8 межі, розмір, modification time і повний streaming SHA-256 fingerprint книги, щоб progress не можна було випадково застосувати до іншого тексту.
 
 ## Чому позиція вимірюється в байтах
 

@@ -83,6 +83,40 @@ func TestDefaultProgressPathUsesUserCache(t *testing.T) {
 	}
 }
 
+func TestInspectFileDetectsSameSizeMiddleEditWithPreservedMtime(t *testing.T) {
+	bookPath := writeBook(t, strings.Repeat("a", 256<<10))
+	original, err := InspectFile(bookPath)
+	if err != nil {
+		t.Fatalf("не вдалося перевірити початкову книгу: %v", err)
+	}
+
+	file, err := os.OpenFile(bookPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("не вдалося відкрити книгу для зміни: %v", err)
+	}
+	if _, err := file.WriteAt([]byte("changed-middle"), 128<<10); err != nil {
+		_ = file.Close()
+		t.Fatalf("не вдалося змінити середину книги: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("не вдалося закрити змінену книгу: %v", err)
+	}
+	if err := os.Chtimes(bookPath, original.ModifiedAt, original.ModifiedAt); err != nil {
+		t.Fatalf("не вдалося відновити modification time: %v", err)
+	}
+
+	current, err := InspectFile(bookPath)
+	if err != nil {
+		t.Fatalf("не вдалося перевірити змінену книгу: %v", err)
+	}
+	if !current.ModifiedAt.Equal(original.ModifiedAt) || current.Size != original.Size {
+		t.Fatalf("умови regression test порушені: original=%#v current=%#v", original, current)
+	}
+	if current.Fingerprint == original.Fingerprint || SameFile(original, current) {
+		t.Fatal("full fingerprint не виявив same-size middle edit зі збереженим mtime")
+	}
+}
+
 func writeBook(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "book.txt")
