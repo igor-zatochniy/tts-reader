@@ -79,6 +79,7 @@ Root package лишається application layer:
 
 - `Pause` змінює стан на `paused`.
 - Playback goroutine перевіряє стан через `waitUntilPlayable(...)` і чекає на `sync.Cond`.
+- Перед кожним викликом TTS уже прочитаний chunk проходить через `admitChunk(...)` під mutex менеджера. Якщо `Pause` переміг у цій точці, chunk не втрачається, а чекає на `Resume` і лише тоді передається engine.
 - Відтворення не створює нову сесію, а лише тимчасово зупиняється.
 
 ### Resume
@@ -93,6 +94,7 @@ Root package лишається application layer:
 - `Stop` не очищає `active` і не створює terminal snapshot: цим одноосібно володіє session finalizer.
 - Finalizer зберігає durable position, атомарно очищає `active`, встановлює `lastErr`, формує snapshot і публікує `playback.stopped`.
 - Якщо `Stop` не дочекався завершення до timeout, він повертає transient `ErrStopping` і не змінює сесію повторно; після фактичного завершення goroutine finalizer переводить стан у `stopped` без timeout-помилки.
+- `BeginShutdown` встановлює shutdown boundary під mutex стану та не очікує довгий file I/O незавершеного `Start`. Перед створенням сесії `Start` повторно перевіряє цю boundary під тим самим mutex, а фінальний `Stop` не чекає `controlMu`, який може залишатися зайнятим таким I/O.
 
 ## Як закриваються SSE-клієнти
 

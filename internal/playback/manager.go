@@ -273,6 +273,11 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 	}
 
 	m.mu.Lock()
+	if m.shuttingDown.Load() {
+		m.mu.Unlock()
+		cancel()
+		return PlaybackSnapshot{}, ErrShuttingDown
+	}
 	if m.state == Stopping {
 		m.mu.Unlock()
 		cancel()
@@ -354,11 +359,14 @@ func (m *PlaybackManager) Resume() (PlaybackSnapshot, error) {
 }
 
 func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
-	m.controlMu.Lock()
-	defer m.controlMu.Unlock()
-
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// Після BeginShutdown нова сесія вже не може пройти фінальну перевірку Start.
+	// Це дозволяє Stop не чекати controlMu, зайнятий тривалим файловим I/O.
+	if !m.shuttingDown.Load() {
+		m.controlMu.Lock()
+		defer m.controlMu.Unlock()
 	}
 
 	m.mu.Lock()
@@ -500,9 +508,9 @@ func (m *PlaybackManager) Snapshot() PlaybackSnapshot {
 
 // BeginShutdown забороняє запуск нових операцій відтворення перед фінальним Stop.
 func (m *PlaybackManager) BeginShutdown() {
-	m.controlMu.Lock()
-	defer m.controlMu.Unlock()
+	m.mu.Lock()
 	m.shuttingDown.Store(true)
+	m.mu.Unlock()
 }
 
 // SubscribeEvents атомарно підписує клієнта та ставить актуальний snapshot першим у чергу.
@@ -559,7 +567,9 @@ func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Boo
 			}
 		}
 
-		m.updateProgress(session.id, "chunk.started", chunk.StartByte)
+		if !m.admitChunk(session, chunk.StartByte) {
+			return sessionResult{state: Stopped}
+		}
 		if err := session.engine.Speak(session.ctx, chunk.Text); err != nil {
 			if session.ctx.Err() != nil {
 				return sessionResult{state: Stopped}
@@ -598,6 +608,22 @@ func (m *PlaybackManager) waitUntilPlayable(session *playbackSession) bool {
 	return session.ctx.Err() == nil && m.state == Playing && m.active == session
 }
 
+// admitChunk не дозволяє вже прочитаному фрагменту перейти до TTS після підтвердження Pause.
+func (m *PlaybackManager) admitChunk(session *playbackSession, pos int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for m.state == Paused && session.ctx.Err() == nil && m.active == session {
+		m.cond.Wait()
+	}
+	if session.ctx.Err() != nil || m.state != Playing || m.active != session {
+		return false
+	}
+	m.currentChunkStart = pos
+	m.currentByte = pos
+	m.publishLocked("chunk.started")
+	return true
+}
+
 func (m *PlaybackManager) current() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -613,9 +639,6 @@ func (m *PlaybackManager) updateProgress(sessionID uint64, eventType string, pos
 	if m.state != Playing && m.state != Paused {
 		m.mu.Unlock()
 		return
-	}
-	if eventType == "chunk.started" {
-		m.currentChunkStart = pos
 	}
 	m.currentByte = pos
 	m.publishLocked(eventType)

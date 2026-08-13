@@ -463,9 +463,14 @@ func TestPlaybackManagerRejectsStartAfterBeginShutdown(t *testing.T) {
 	}
 }
 
-func TestPlaybackManagerSerializesBeginShutdownAfterInFlightStart(t *testing.T) {
+func TestPlaybackManagerBeginShutdownDoesNotWaitForInFlightStartIO(t *testing.T) {
 	loadStarted := make(chan struct{}, 1)
 	releaseLoad := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseLoad) })
+	}
+	defer release()
 	manager := NewManagerWithProgress(
 		func(tts.Config) tts.Engine {
 			return &testEngine{speakContext: func(ctx context.Context, text string) error {
@@ -502,32 +507,102 @@ func TestPlaybackManagerSerializesBeginShutdownAfterInFlightStart(t *testing.T) 
 
 	select {
 	case <-shutdownDone:
-		t.Fatal("BeginShutdown не має обходити Start, який уже володіє controlMu")
-	case <-time.After(20 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("BeginShutdown заблокувався на файловому I/O операції Start")
 	}
 
-	close(releaseLoad)
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancelStop()
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Stop(stopCtx)
+		stopDone <- err
+	}()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop під час shutdown не має чекати in-flight Start: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop під час shutdown заблокувався на файловому I/O операції Start")
+	}
+
+	release()
 
 	select {
 	case err := <-startErr:
-		if err != nil {
-			t.Fatalf("операція Start, що почалася першою, має завершитися: %v", err)
+		if !errors.Is(err, ErrShuttingDown) {
+			t.Fatalf("in-flight Start має відхилитися після shutdown boundary: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start не завершився після shutdown")
 	}
 
-	select {
-	case <-shutdownDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("BeginShutdown не завершився після Start")
-	}
-
 	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID}); !errors.Is(err, ErrShuttingDown) {
 		t.Fatalf("нова операція після BeginShutdown має повертати ErrShuttingDown, отримано %v", err)
 	}
-	if _, err := manager.Stop(context.Background()); err != nil {
-		t.Fatalf("не вдалося зупинити in-flight playback: %v", err)
+	if snapshot := manager.Snapshot(); snapshot.State != Stopped {
+		t.Fatalf("in-flight Start створив playback session після shutdown: %#v", snapshot)
+	}
+}
+
+func TestPauseBlocksAlreadyReadChunkUntilResume(t *testing.T) {
+	spoken := make(chan string, 1)
+	engineFactory := func(tts.Config) tts.Engine {
+		return &testEngine{speakContext: func(ctx context.Context, text string) error {
+			spoken <- text
+			return nil
+		}}
+	}
+	manager := NewManager(engineFactory, time.Second, NewEventBroker())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &playbackSession{id: 1, ctx: ctx, cancel: cancel, engine: engineFactory(tts.Config{})}
+
+	manager.mu.Lock()
+	manager.state = Playing
+	manager.active = session
+	manager.mu.Unlock()
+
+	if !manager.waitUntilPlayable(session) {
+		t.Fatal("worker не пройшов початкову перевірку Playing")
+	}
+	if snapshot, err := manager.Pause(); err != nil || snapshot.State != Paused {
+		t.Fatalf("Pause не підтвердив paused: snapshot=%#v err=%v", snapshot, err)
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		if !manager.admitChunk(session, 10) {
+			done <- false
+			return
+		}
+		_ = session.engine.Speak(session.ctx, "Другий фрагмент")
+		done <- true
+	}()
+
+	select {
+	case text := <-spoken:
+		t.Fatalf("новий фрагмент стартував після підтвердження Pause: %q", text)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if snapshot := manager.Snapshot(); snapshot.State != Paused || snapshot.CurrentByte == 10 {
+		t.Fatalf("chunk був допущений під час Pause: %#v", snapshot)
+	}
+
+	if snapshot, err := manager.Resume(); err != nil || snapshot.State != Playing {
+		t.Fatalf("Resume не відновив playback: snapshot=%#v err=%v", snapshot, err)
+	}
+	select {
+	case text := <-spoken:
+		if text != "Другий фрагмент" {
+			t.Fatalf("озвучено не той збережений фрагмент: %q", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("збережений фрагмент не стартував після Resume")
+	}
+	if admitted := <-done; !admitted {
+		t.Fatal("збережений фрагмент було втрачено після Resume")
 	}
 }
 
