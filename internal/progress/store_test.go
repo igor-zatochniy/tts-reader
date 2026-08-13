@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/igor-zatochniy/tts-reader/internal/book"
@@ -79,6 +80,50 @@ func TestLeasePreventsConcurrentAccessAndCanBeReacquired(t *testing.T) {
 	if err := second.Close(); err != nil {
 		t.Fatalf("не вдалося звільнити повторний lease: %v", err)
 	}
+}
+
+func TestLeaseCloseFailureReleasesProcessMarker(t *testing.T) {
+	closeErr := errors.New("close failed")
+	platform := &failingPlatformLease{err: closeErr}
+	key := filepath.Join(t.TempDir(), "progress.json.lock")
+
+	activeLeases.Lock()
+	activeLeases.paths[key] = struct{}{}
+	activeLeases.Unlock()
+	t.Cleanup(func() {
+		activeLeases.Lock()
+		delete(activeLeases.paths, key)
+		activeLeases.Unlock()
+	})
+
+	lease := &Lease{key: key, platform: platform}
+	if err := lease.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Close має повернути platform error, отримано %v", err)
+	}
+
+	activeLeases.Lock()
+	_, exists := activeLeases.paths[key]
+	activeLeases.Unlock()
+	if exists {
+		t.Fatal("невдалий platform Close залишив in-process lease marker")
+	}
+
+	if err := lease.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("повторний Close має повернути початкову помилку, отримано %v", err)
+	}
+	if calls := platform.calls.Load(); calls != 1 {
+		t.Fatalf("platform Close викликано %d разів, очікувався один виклик", calls)
+	}
+}
+
+type failingPlatformLease struct {
+	err   error
+	calls atomic.Int32
+}
+
+func (l *failingPlatformLease) Close() error {
+	l.calls.Add(1)
+	return l.err
 }
 
 func TestLeaseBlocksAnotherProcess(t *testing.T) {

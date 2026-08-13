@@ -86,7 +86,6 @@ func (l *Lease) Close() error {
 	l.once.Do(func() {
 		if err := l.platform.Close(); err != nil {
 			l.err = fmt.Errorf("release progress lock: %w", err)
-			return
 		}
 		activeLeases.Lock()
 		delete(activeLeases.paths, l.key)

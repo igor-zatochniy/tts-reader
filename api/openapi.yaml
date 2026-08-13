@@ -76,6 +76,8 @@ paths:
           $ref: "#/components/responses/Error"
         "401":
           $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
         "503":
@@ -123,6 +125,8 @@ paths:
           $ref: "#/components/responses/Error"
         "401":
           $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
         "503":
@@ -160,6 +164,8 @@ paths:
           $ref: "#/components/responses/Error"
         "401":
           $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -180,6 +186,8 @@ paths:
         "409":
           $ref: "#/components/responses/Error"
         "401":
+          $ref: "#/components/responses/Error"
+        "403":
           $ref: "#/components/responses/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
@@ -205,6 +213,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "401":
+          $ref: "#/components/responses/Error"
+        "403":
           $ref: "#/components/responses/Error"
         "500":
           description: Engine stop or progress persistence returned an internal error
@@ -243,6 +253,8 @@ paths:
           $ref: "#/components/responses/Error"
         "401":
           $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
         "503":
@@ -265,6 +277,8 @@ paths:
                 type: string
                 example: "id: 42\nevent: progress.updated\ndata: {\"seq\":42,\"type\":\"progress.updated\"}\n\n"
         "401":
+          $ref: "#/components/responses/Error"
+        "403":
           $ref: "#/components/responses/Error"
         "500":
           $ref: "#/components/responses/Error"
