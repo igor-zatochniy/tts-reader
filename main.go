@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -344,29 +345,45 @@ func (a *App) saveProgress(pos int64) error {
 }
 
 func interruptContext() (context.Context, func()) {
-	ctx, cancel := context.WithCancel(context.Background())
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	ctx, cleanup := interruptContextWithSignals(signals, os.Exit)
+
+	return ctx, func() {
+		signal.Stop(signals)
+		cleanup()
+	}
+}
+
+func interruptContextWithSignals(signals <-chan os.Signal, exit func(int)) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var cleanupOnce sync.Once
 
 	go func() {
+		defer close(done)
 		select {
 		case <-signals:
 			cancel()
-		case <-ctx.Done():
+		case <-stop:
 			return
 		}
 
 		select {
 		case <-signals:
-			os.Exit(130)
-		case <-ctx.Done():
+			exit(130)
+		case <-stop:
 			return
 		}
 	}()
 
 	return ctx, func() {
-		signal.Stop(signals)
-		cancel()
+		cleanupOnce.Do(func() {
+			close(stop)
+			cancel()
+		})
+		<-done
 	}
 }
 

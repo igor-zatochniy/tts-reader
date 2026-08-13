@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -413,6 +414,67 @@ func TestFunctionEngineStopCancelsActiveSpeak(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Speak не завершився після Stop")
+	}
+}
+
+func TestInterruptContextUsesSecondSignalForForcedExit(t *testing.T) {
+	signals := make(chan os.Signal, 3)
+	exitCodes := make(chan int, 2)
+	ctx, cleanup := interruptContextWithSignals(signals, func(code int) {
+		exitCodes <- code
+	})
+	defer cleanup()
+
+	signals <- os.Interrupt
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("перший сигнал не скасував context")
+	}
+	select {
+	case code := <-exitCodes:
+		t.Fatalf("перший сигнал не має викликати forced exit: %d", code)
+	default:
+	}
+
+	signals <- syscall.SIGTERM
+	select {
+	case code := <-exitCodes:
+		if code != 130 {
+			t.Fatalf("очікував forced exit code 130, отримав %d", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("другий сигнал не викликав forced exit")
+	}
+
+	signals <- os.Interrupt
+	select {
+	case code := <-exitCodes:
+		t.Fatalf("exit callback викликано більше одного разу: %d", code)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestInterruptContextCleanupStopsHandler(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	exitCodes := make(chan int, 1)
+	ctx, cleanup := interruptContextWithSignals(signals, func(code int) {
+		exitCodes <- code
+	})
+
+	cleanup()
+	cleanup()
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("cleanup не скасував context")
+	}
+
+	signals <- os.Interrupt
+	select {
+	case code := <-exitCodes:
+		t.Fatalf("signal handler залишився активним після cleanup: %d", code)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
