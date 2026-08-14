@@ -1,6 +1,6 @@
 module github.com/igor-zatochniy/tts-reader
 
-go 1.25.12
+go 1.25.13
 
 tool github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen
 
