@@ -209,3 +209,12 @@ func SameFile(registered FileIdentity, current FileIdentity) bool {
 		registered.ModifiedAt.Equal(current.ModifiedAt) &&
 		registered.Fingerprint == current.Fingerprint
 }
+
+func SameFileMetadata(registered FileIdentity, info os.FileInfo) bool {
+	if info == nil {
+		return false
+	}
+
+	return registered.Size == info.Size() &&
+		registered.ModifiedAt.Equal(info.ModTime().UTC())
+}

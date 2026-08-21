@@ -208,6 +208,8 @@ func TestPlaybackRejectsSameSizeMiddleEditDuringPlayback(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	var firstSpeak sync.Once
+	var spokenMu sync.Mutex
+	var spoken []string
 	store := &trackingProgressStore{}
 	manager := NewManagerWithProgress(
 		func(tts.Config) tts.Engine {
@@ -216,6 +218,9 @@ func TestPlaybackRejectsSameSizeMiddleEditDuringPlayback(t *testing.T) {
 					started <- struct{}{}
 					<-release
 				})
+				spokenMu.Lock()
+				spoken = append(spoken, text)
+				spokenMu.Unlock()
 				return nil
 			}}
 		},
@@ -260,6 +265,12 @@ func TestPlaybackRejectsSameSizeMiddleEditDuringPlayback(t *testing.T) {
 	}
 	if saved := store.lastSavedPosition(); saved <= 0 {
 		t.Fatalf("progress не має скидатися після middle edit: %d", saved)
+	}
+	spokenMu.Lock()
+	heard := strings.Join(spoken, "")
+	spokenMu.Unlock()
+	if strings.Contains(heard, "changed-middle") {
+		t.Fatalf("змінений фрагмент не можна передавати до TTS: %q", heard)
 	}
 }
 

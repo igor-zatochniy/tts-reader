@@ -188,6 +188,19 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 			}
 			return 1
 		}
+		info, statErr := bookFile.Stat()
+		if statErr != nil || !book.SameFileMetadata(app.book, info) {
+			pos := app.pos.Load()
+			if statErr != nil {
+				fmt.Fprintf(stderr, "\n[ПОМИЛКА КНИГИ] Не вдалося перевірити файл перед озвученням фрагмента: %v\n", statErr)
+			} else {
+				fmt.Fprintln(stderr, "\n[ПОМИЛКА КНИГИ] Файл книги змінено під час читання")
+			}
+			if saveErr := app.saveProgress(pos); saveErr != nil {
+				fmt.Fprintf(stderr, "Помилка: не вдалося зберегти прогрес після зміни книги: %v\n", saveErr)
+			}
+			return 1
+		}
 
 		app.pos.Store(chunk.StartByte)
 		if err := app.speaker(app.ctx, chunk.Text); err != nil {

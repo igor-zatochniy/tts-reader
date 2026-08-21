@@ -566,6 +566,9 @@ func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Boo
 				err:      fmt.Errorf("%w: chunk ends past registered book size", bookpkg.ErrModified),
 			}
 		}
+		if err := validatePlaybackBookMetadata(file, book.File); err != nil {
+			return sessionResult{state: Failed, position: durablePosition, err: err}
+		}
 
 		if !m.admitChunk(session, chunk.StartByte) {
 			return sessionResult{state: Stopped}
@@ -586,6 +589,17 @@ func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Boo
 		durablePosition = chunk.EndByte
 		m.updateProgress(session.id, "progress.updated", chunk.EndByte)
 	}
+}
+
+func validatePlaybackBookMetadata(file *os.File, expected bookpkg.FileIdentity) error {
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("%w: stat book before chunk playback: %v", bookpkg.ErrModified, err)
+	}
+	if !bookpkg.SameFileMetadata(expected, info) {
+		return fmt.Errorf("%w: book metadata changed during playback", bookpkg.ErrModified)
+	}
+	return nil
 }
 
 func validatePlaybackBookUnchanged(book bookpkg.Book) error {

@@ -347,6 +347,63 @@ func TestRunDoesNotResetProgressWhenBookChangesDuringPlayback(t *testing.T) {
 	}
 }
 
+func TestRunDoesNotSpeakSameSizeBookEdit(t *testing.T) {
+	dir := t.TempDir()
+	bookPath := filepath.Join(dir, "book.txt")
+	save := filepath.Join(dir, "save.json")
+	mustWriteFile(t, bookPath, strings.Repeat("a", 256<<10))
+	identity, err := bookpkg.InspectFile(bookPath)
+	if err != nil {
+		t.Fatalf("не вдалося перевірити тестову книгу: %v", err)
+	}
+
+	firstChunk := true
+	var spoken []string
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", bookPath, "-save", save, "-chunk", "10000"}, &stdout, &stderr, testSpeaker(func(text string) error {
+		spoken = append(spoken, text)
+		if !firstChunk {
+			return nil
+		}
+		firstChunk = false
+
+		file, err := os.OpenFile(bookPath, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		if _, err := file.WriteAt([]byte("changed-middle"), 128<<10); err != nil {
+			_ = file.Close()
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		changedTime := identity.ModifiedAt.Add(2 * time.Second)
+		return os.Chtimes(bookPath, changedTime, changedTime)
+	}), false)
+
+	if code != 1 {
+		t.Fatalf("очікував exit code 1 після зміни книги, отримав %d", code)
+	}
+	if !strings.Contains(stderr.String(), "змінено під час читання") {
+		t.Fatalf("очікував помилку зміни книги, stderr=%q", stderr.String())
+	}
+	if heard := strings.Join(spoken, ""); strings.Contains(heard, "changed-middle") {
+		t.Fatalf("змінений фрагмент не можна передавати до TTS: %q", heard)
+	}
+	data, err := os.ReadFile(save)
+	if err != nil {
+		t.Fatalf("не вдалося прочитати progress: %v", err)
+	}
+	var saved progresspkg.Progress
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatalf("не вдалося декодувати progress: %v", err)
+	}
+	if saved.LastPosition <= 0 {
+		t.Fatalf("progress не має скидатися після зміни книги: %#v", saved)
+	}
+}
+
 func TestRunRejectsInvalidUTF8Book(t *testing.T) {
 	dir := t.TempDir()
 	book := filepath.Join(dir, "book.txt")
