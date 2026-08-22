@@ -528,11 +528,18 @@ func (m *PlaybackManager) play(session *playbackSession, book bookpkg.Book, star
 }
 
 func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Book, startPos int64, chunkSize int) sessionResult {
-	file, err := os.Open(book.Path)
+	file, stableIdentity, err := bookpkg.OpenStableRead(book.Path)
 	if err != nil {
 		return sessionResult{state: Failed, position: startPos, err: err}
 	}
 	defer file.Close()
+	if !bookpkg.SameFile(book.File, stableIdentity) {
+		return sessionResult{
+			state:    Failed,
+			position: startPos,
+			err:      fmt.Errorf("%w: stable playback handle does not match registered book", bookpkg.ErrModified),
+		}
+	}
 
 	if _, err := file.Seek(startPos, io.SeekStart); err != nil {
 		return sessionResult{state: Failed, position: startPos, err: err}

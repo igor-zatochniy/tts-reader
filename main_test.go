@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -319,14 +320,29 @@ func TestRunDoesNotResetProgressWhenBookChangesDuringPlayback(t *testing.T) {
 	mustWriteFile(t, book, strings.Repeat("Фрагмент тексту. ", 400))
 
 	firstChunk := true
+	var truncateErr error
 	var stdout, stderr bytes.Buffer
 	code := runWithOptions([]string{"-book", book, "-save", save, "-chunk", "32"}, &stdout, &stderr, testSpeaker(func(text string) error {
 		if firstChunk {
 			firstChunk = false
-			return os.Truncate(book, 0)
+			truncateErr = os.Truncate(book, 0)
+			if runtime.GOOS == "windows" {
+				return nil
+			}
+			return truncateErr
 		}
 		return nil
 	}), false)
+	if runtime.GOOS == "windows" {
+		if code != 0 {
+			t.Fatalf("stable playback має завершитися без зміни книги, code=%d stderr=%q", code, stderr.String())
+		}
+		if !errors.Is(truncateErr, syscall.Errno(32)) {
+			t.Fatalf("очікувалася Windows sharing violation, отримано %v", truncateErr)
+		}
+		assertSavedPosition(t, save, 0)
+		return
+	}
 
 	if code != 1 {
 		t.Fatalf("очікував exit code 1 після зміни книги, отримав %d", code)
@@ -358,6 +374,7 @@ func TestRunDoesNotSpeakSameSizeBookEdit(t *testing.T) {
 	}
 
 	firstChunk := true
+	var writeErr error
 	var spoken []string
 	var stdout, stderr bytes.Buffer
 	code := runWithOptions([]string{"-book", bookPath, "-save", save, "-chunk", "10000"}, &stdout, &stderr, testSpeaker(func(text string) error {
@@ -369,7 +386,8 @@ func TestRunDoesNotSpeakSameSizeBookEdit(t *testing.T) {
 
 		file, err := os.OpenFile(bookPath, os.O_WRONLY, 0)
 		if err != nil {
-			return err
+			writeErr = err
+			return nil
 		}
 		if _, err := file.WriteAt([]byte("changed-middle"), 128<<10); err != nil {
 			_ = file.Close()
@@ -381,6 +399,18 @@ func TestRunDoesNotSpeakSameSizeBookEdit(t *testing.T) {
 		changedTime := identity.ModifiedAt.Add(2 * time.Second)
 		return os.Chtimes(bookPath, changedTime, changedTime)
 	}), false)
+	if runtime.GOOS == "windows" {
+		if code != 0 {
+			t.Fatalf("stable playback має завершитися без зміни книги, code=%d stderr=%q", code, stderr.String())
+		}
+		if !errors.Is(writeErr, syscall.Errno(32)) {
+			t.Fatalf("очікувалася Windows sharing violation, отримано %v", writeErr)
+		}
+		if heard := strings.Join(spoken, ""); strings.Contains(heard, "changed-middle") {
+			t.Fatalf("змінений фрагмент не можна передавати до TTS: %q", heard)
+		}
+		return
+	}
 
 	if code != 1 {
 		t.Fatalf("очікував exit code 1 після зміни книги, отримав %d", code)

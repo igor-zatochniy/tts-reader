@@ -145,12 +145,16 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 	fmt.Fprintln(stdout, "Ctrl+C для виходу.")
 	fmt.Fprintln(stdout, "------------------------------------------------")
 
-	bookFile, err := os.Open(cfg.BookFile)
+	bookFile, stableIdentity, err := book.OpenStableRead(cfg.BookFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося відкрити файл книги %q: %v\n", cfg.BookFile, err)
 		return 1
 	}
 	defer bookFile.Close()
+	if !book.SameFile(app.book, stableIdentity) {
+		fmt.Fprintln(stderr, "Помилка: файл книги змінено перед початком читання")
+		return 1
+	}
 
 	if _, err := bookFile.Seek(startPos, io.SeekStart); err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося перейти до позиції %d bytes у книзі: %v\n", startPos, err)

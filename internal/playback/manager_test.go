@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -135,9 +137,21 @@ func TestPlaybackRejectsTruncatedBookDuringPlayback(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("playback не стартував")
 	}
-	if err := os.Truncate(registeredBook.Path, 0); err != nil {
+	truncateErr := os.Truncate(registeredBook.Path, 0)
+	if runtime.GOOS == "windows" {
+		if !errors.Is(truncateErr, syscall.Errno(32)) {
+			close(release)
+			t.Fatalf("очікувалася Windows sharing violation, отримано %v", truncateErr)
+		}
 		close(release)
-		t.Fatalf("не вдалося скоротити книгу: %v", err)
+		if snapshot := waitState(t, manager, Finished); snapshot.ErrorCode != "" {
+			t.Fatalf("незмінена книга не має завершуватися з помилкою: %#v", snapshot)
+		}
+		return
+	}
+	if truncateErr != nil {
+		close(release)
+		t.Fatalf("не вдалося скоротити книгу: %v", truncateErr)
 	}
 	close(release)
 
@@ -180,6 +194,22 @@ func TestPlaybackRejectsAppendedContentPastRegisteredSize(t *testing.T) {
 		t.Fatal("playback не стартував")
 	}
 	file, err := os.OpenFile(registeredBook.Path, os.O_APPEND|os.O_WRONLY, 0)
+	if runtime.GOOS == "windows" {
+		if err == nil {
+			_ = file.Close()
+			close(release)
+			t.Fatal("stable playback handle дозволив append writer")
+		}
+		if !errors.Is(err, syscall.Errno(32)) {
+			close(release)
+			t.Fatalf("очікувалася Windows sharing violation, отримано %v", err)
+		}
+		close(release)
+		if snapshot := waitState(t, manager, Finished); snapshot.ErrorCode != "" {
+			t.Fatalf("незмінена книга не має завершуватися з помилкою: %#v", snapshot)
+		}
+		return
+	}
 	if err != nil {
 		close(release)
 		t.Fatalf("не вдалося відкрити книгу для доповнення: %v", err)
@@ -239,6 +269,30 @@ func TestPlaybackRejectsSameSizeMiddleEditDuringPlayback(t *testing.T) {
 		t.Fatal("playback не стартував")
 	}
 	file, err := os.OpenFile(registeredBook.Path, os.O_WRONLY, 0)
+	if runtime.GOOS == "windows" {
+		if err == nil {
+			_ = file.Close()
+			close(release)
+			t.Fatal("stable playback handle дозволив concurrent writer")
+		}
+		if !errors.Is(err, syscall.Errno(32)) {
+			close(release)
+			t.Fatalf("очікувалася Windows sharing violation, отримано %v", err)
+		}
+		close(release)
+
+		snapshot := waitState(t, manager, Finished)
+		if snapshot.ErrorCode != "" {
+			t.Fatalf("незмінена книга не має завершуватися з помилкою: %#v", snapshot)
+		}
+		spokenMu.Lock()
+		heard := strings.Join(spoken, "")
+		spokenMu.Unlock()
+		if strings.Contains(heard, "changed-middle") {
+			t.Fatalf("змінений фрагмент не можна передавати до TTS: %q", heard)
+		}
+		return
+	}
 	if err != nil {
 		close(release)
 		t.Fatalf("не вдалося відкрити книгу для зміни: %v", err)

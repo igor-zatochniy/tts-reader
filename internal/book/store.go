@@ -175,7 +175,29 @@ func InspectFile(path string) (FileIdentity, error) {
 		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
 	defer file.Close()
+	return inspectOpenFile(file)
+}
 
+// OpenStableRead відкриває книгу для playback і перевіряє fingerprint саме цього handle.
+func OpenStableRead(path string) (*os.File, FileIdentity, error) {
+	file, err := openStableRead(path)
+	if err != nil {
+		return nil, FileIdentity{}, fmt.Errorf("%w: %w", ErrNotReadable, err)
+	}
+
+	identity, err := inspectOpenFile(file)
+	if err != nil {
+		_ = file.Close()
+		return nil, FileIdentity{}, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		return nil, FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
+	}
+	return file, identity, nil
+}
+
+func inspectOpenFile(file *os.File) (FileIdentity, error) {
 	info, err := file.Stat()
 	if err != nil {
 		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
