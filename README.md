@@ -41,7 +41,7 @@ Next chunk
 ## Вимоги
 
 - Windows 10/11.
-- Go 1.25.13 або сумісний patched toolchain.
+- Go 1.26.7 або сумісний patched toolchain.
 - PowerShell із доступом до `System.Speech`.
 
 ## Releases

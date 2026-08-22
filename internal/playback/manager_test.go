@@ -1117,7 +1117,11 @@ func waitState(t *testing.T, manager *PlaybackManager, want string) PlaybackSnap
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("стан playback не став %q, останній snapshot: %#v", want, manager.Snapshot())
+	snapshot := manager.Snapshot()
+	if snapshot.State == want {
+		return snapshot
+	}
+	t.Fatalf("стан playback не став %q, останній snapshot: %#v", want, snapshot)
 	return PlaybackSnapshot{}
 }
 
