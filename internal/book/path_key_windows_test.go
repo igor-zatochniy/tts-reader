@@ -52,11 +52,20 @@ func TestBookStoreDistinguishesFilesInCaseSensitiveDirectory(t *testing.T) {
 	if first.SaveFile == second.SaveFile {
 		t.Fatalf("різні файли отримали спільний progress-файл %q", first.SaveFile)
 	}
-	if first.Path != firstPath || second.Path != secondPath {
-		t.Fatalf("store змішав шляхи книг: first=%q second=%q", first.Path, second.Path)
+	if filepath.Base(first.Path) != "Book.txt" || filepath.Base(second.Path) != "book.txt" {
+		t.Fatalf("store втратив регістр шляхів: first=%q second=%q", first.Path, second.Path)
 	}
 	if first.File.Fingerprint == second.File.Fingerprint {
 		t.Fatal("умови regression test порушені: fingerprints збігаються")
+	}
+	for _, registered := range []Book{first, second} {
+		current, err := InspectFile(registered.Path)
+		if err != nil {
+			t.Fatalf("не вдалося перевірити шлях %q: %v", registered.Path, err)
+		}
+		if !SameFile(registered.File, current) {
+			t.Fatalf("шлях не відповідає identity книги: %#v current=%#v", registered, current)
+		}
 	}
 	if got := len(store.List()); got != 2 {
 		t.Fatalf("очікувалися дві окремі книги, отримано %d", got)
