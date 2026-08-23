@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -162,10 +161,7 @@ func canonicalBookPath(path string) (string, string, error) {
 	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
 		absPath = filepath.Clean(resolved)
 	}
-	key := absPath
-	if runtime.GOOS == "windows" {
-		key = strings.ToLower(key)
-	}
+	key := canonicalPathKey(absPath)
 	return absPath, key, nil
 }
 
