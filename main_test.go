@@ -146,6 +146,29 @@ func TestRunRejectsProgressFromDifferentBook(t *testing.T) {
 	}
 }
 
+func TestRunRejectsOversizedProgressFile(t *testing.T) {
+	dir := t.TempDir()
+	book := filepath.Join(dir, "book.txt")
+	save := filepath.Join(dir, "progress.json")
+	mustWriteFile(t, book, "Книга")
+	if err := os.WriteFile(save, nil, 0600); err != nil {
+		t.Fatalf("не вдалося створити progress-файл: %v", err)
+	}
+	if err := os.Truncate(save, progresspkg.MaxProgressFileSize+1); err != nil {
+		t.Fatalf("не вдалося збільшити progress-файл: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", book, "-save", save}, &stdout, &stderr, testSpeaker(nil), false)
+
+	if code != 1 {
+		t.Fatalf("очікував exit code 1, отримав %d", code)
+	}
+	if !strings.Contains(stderr.String(), "непідтримуваний формат") {
+		t.Fatalf("очікував помилку формату progress, stderr=%q", stderr.String())
+	}
+}
+
 func TestDefaultProgressPathUsesSeparateHashedFiles(t *testing.T) {
 	dir := t.TempDir()
 	txt := filepath.Join(dir, "novel.txt")

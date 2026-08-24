@@ -303,10 +303,13 @@ func (a *App) resolveStartPosition(bookSize int64) (int64, error) {
 }
 
 func (a *App) loadProgress(bookIdentity book.FileIdentity) (int64, bool, error) {
-	file, err := os.ReadFile(a.cfg.SaveFile)
+	file, err := progress.ReadFile(a.cfg.SaveFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, false, nil
+		}
+		if errors.Is(err, progress.ErrFormat) {
+			return 0, false, fmt.Errorf("файл прогресу має непідтримуваний формат: %w", err)
 		}
 		return 0, false, fmt.Errorf("не вдалося прочитати файл прогресу %q: %w", a.cfg.SaveFile, err)
 	}

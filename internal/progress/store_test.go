@@ -11,6 +11,30 @@ import (
 	"github.com/igor-zatochniy/tts-reader/internal/book"
 )
 
+func TestJSONProgressStoreRejectsOversizedFile(t *testing.T) {
+	dir := t.TempDir()
+	bookPath := filepath.Join(dir, "book.txt")
+	savePath := filepath.Join(dir, "progress.json")
+	if err := os.WriteFile(bookPath, []byte("Книга"), 0600); err != nil {
+		t.Fatalf("не вдалося створити книгу: %v", err)
+	}
+	if err := os.WriteFile(savePath, nil, 0600); err != nil {
+		t.Fatalf("не вдалося створити progress-файл: %v", err)
+	}
+	if err := os.Truncate(savePath, MaxProgressFileSize+1); err != nil {
+		t.Fatalf("не вдалося збільшити progress-файл: %v", err)
+	}
+
+	identity, err := book.InspectFile(bookPath)
+	if err != nil {
+		t.Fatalf("не вдалося перевірити книгу: %v", err)
+	}
+	registered := BookForProgress(bookPath, savePath, identity)
+	if _, err := (JSONProgressStore{}).Load(registered, identity.Size); !errors.Is(err, ErrFormat) {
+		t.Fatalf("очікував ErrFormat для завеликого progress-файлу, отримав %v", err)
+	}
+}
+
 func TestValidateForBookRejectsSameSizeMiddleEditWithPreservedMtime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "book.txt")
 	content := make([]byte, 256<<10)

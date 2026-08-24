@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/igor-zatochniy/tts-reader/internal/book"
@@ -12,8 +13,9 @@ import (
 
 const (
 	// Позиція прогресу зберігається в байтах, бо рядки Go індексуються байтовими зміщеннями.
-	Unit    = "bytes (UTF-8)"
-	Version = 4
+	Unit                = "bytes (UTF-8)"
+	Version             = 4
+	MaxProgressFileSize = 64 << 10
 )
 
 var (
@@ -41,7 +43,7 @@ type ProgressStore interface {
 type JSONProgressStore struct{}
 
 func (JSONProgressStore) Load(book book.Book, currentSize int64) (int64, error) {
-	data, err := os.ReadFile(book.SaveFile)
+	data, err := ReadFile(book.SaveFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, nil
@@ -68,6 +70,23 @@ func (JSONProgressStore) Load(book book.Book, currentSize int64) (int64, error) 
 		return 0, nil
 	}
 	return pos, nil
+}
+
+func ReadFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, MaxProgressFileSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxProgressFileSize {
+		return nil, fmt.Errorf("%w: file exceeds %d bytes", ErrFormat, MaxProgressFileSize)
+	}
+	return data, nil
 }
 
 func (JSONProgressStore) Save(book book.Book, pos int64) error {
