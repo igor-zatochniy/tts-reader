@@ -153,6 +153,72 @@ func TestServerShutdownWithOpenSSE(t *testing.T) {
 	}
 }
 
+func TestServerShutdownCancelsVoiceDiscovery(t *testing.T) {
+	started := make(chan struct{})
+	engines := tts.NewFunctionEngineFactory(
+		func(tts.Config) tts.SpeakFunc {
+			return func(context.Context, string) error { return nil }
+		},
+		func(ctx context.Context) ([]string, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	)
+	api := newTestLocalAPIWithEngineFactory(t, engines)
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	defer cancelServe()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("не вдалося відкрити test listener: %v", err)
+	}
+	server := newLocalHTTPServer(listener.Addr().String(), api.Routes(), serveCtx)
+	defer server.Close()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Serve(listener)
+	}()
+
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		req, requestErr := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/api/v1/voices", nil)
+		if requestErr != nil {
+			return
+		}
+		req.Header.Set("X-TTS-Token", "test-token")
+		resp, requestErr := http.DefaultClient.Do(req)
+		if requestErr == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("voice discovery не стартував")
+	}
+
+	api.BeginShutdown()
+	cancelServe()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
+	shutdownErr := server.Shutdown(shutdownCtx)
+	cancelShutdown()
+	if shutdownErr != nil {
+		t.Fatalf("Shutdown заблокувався на voice discovery: %v", shutdownErr)
+	}
+
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP-запит voice discovery не завершився після shutdown")
+	}
+	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("неочікувана помилка server.Serve: %v", err)
+	}
+}
+
 func TestLocalAPIRejectsPlaybackStartDuringShutdown(t *testing.T) {
 	api := newTestLocalAPI(t, nil)
 	registeredBook := addTestBook(t, api, writeTempBook(t, "Книга."))

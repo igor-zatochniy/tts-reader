@@ -15,6 +15,9 @@ func newSpeaker(cfg tts.Config) tts.SpeakFunc {
 	}
 }
 
-func listVoices() ([]string, error) {
+func listVoices(ctx context.Context) ([]string, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	return nil, fmt.Errorf("Windows SAPI voice discovery is supported only on Windows Desktop")
 }

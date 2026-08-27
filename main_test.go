@@ -489,7 +489,7 @@ func TestFunctionEngineStopCancelsActiveSpeak(t *testing.T) {
 				return ctx.Err()
 			}
 		},
-		func() ([]string, error) { return nil, nil },
+		func(context.Context) ([]string, error) { return nil, nil },
 	)(tts.Config{})
 
 	speakDone := make(chan error, 1)

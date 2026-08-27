@@ -17,7 +17,7 @@ type Config struct {
 
 type SpeakFunc func(ctx context.Context, text string) error
 type SpeakerFactory func(cfg Config) SpeakFunc
-type VoiceProvider func() ([]string, error)
+type VoiceProvider func(ctx context.Context) ([]string, error)
 type EngineFactory func(cfg Config) Engine
 
 type Voice struct {
@@ -71,7 +71,10 @@ func (e *functionEngine) Speak(ctx context.Context, text string) error {
 }
 
 func (e *functionEngine) Voices(ctx context.Context) ([]Voice, error) {
-	names, err := e.voices()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	names, err := e.voices(ctx)
 	if err != nil {
 		return nil, err
 	}

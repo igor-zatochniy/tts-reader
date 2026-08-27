@@ -80,13 +80,16 @@ func cleanTTSEnvironment(env []string) []string {
 	return cleaned
 }
 
-func listVoices() ([]string, error) {
+func listVoices(parent context.Context) ([]string, error) {
 	psScript := "$ErrorActionPreference = 'Stop'; " +
 		"Add-Type -AssemblyName System.Speech; " +
 		"$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; " +
 		"$speak.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
@@ -100,6 +103,9 @@ func listVoices() ([]string, error) {
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, powerShellCommandError("voice discovery timed out", ctx.Err(), stderr.String())
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		return nil, powerShellCommandError("voice discovery failed", err, stderr.String())
 	}

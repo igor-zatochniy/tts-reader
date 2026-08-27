@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/igor-zatochniy/tts-reader/internal/chunk"
 )
@@ -68,12 +69,26 @@ func TestPowerShellCommandErrorIncludesStderr(t *testing.T) {
 	}
 }
 
+func TestListVoicesHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	startedAt := time.Now()
+	_, err := listVoices(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("очікував context.Canceled, отримав %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("voice discovery надто довго обробляв скасований context: %s", elapsed)
+	}
+}
+
 func TestWindowsSAPIVoiceDiscoverySmoke(t *testing.T) {
 	if os.Getenv("RUN_WINDOWS_SAPI_SMOKE") != "1" {
 		t.Skip("встановіть RUN_WINDOWS_SAPI_SMOKE=1 для перевірки SAPI у Windows Desktop-сесії")
 	}
 
-	if _, err := listVoices(); err != nil {
+	if _, err := listVoices(context.Background()); err != nil {
 		t.Fatalf("Windows SAPI smoke test failed: %v", err)
 	}
 }
