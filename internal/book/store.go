@@ -165,6 +165,37 @@ func canonicalBookPath(path string) (string, string, error) {
 	return absPath, key, nil
 }
 
+// PathsReferToSameFile перевіряє як канонічні шляхи, так і файлову ідентичність.
+func PathsReferToSameFile(firstPath string, secondPath string) (bool, error) {
+	firstAbs, firstKey, err := canonicalBookPath(firstPath)
+	if err != nil {
+		return false, err
+	}
+	secondAbs, secondKey, err := canonicalBookPath(secondPath)
+	if err != nil {
+		return false, err
+	}
+	if firstKey == secondKey {
+		return true, nil
+	}
+
+	firstInfo, err := os.Stat(firstAbs)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	secondInfo, err := os.Stat(secondAbs)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return os.SameFile(firstInfo, secondInfo), nil
+}
+
 func InspectFile(path string) (FileIdentity, error) {
 	file, err := os.Open(path)
 	if err != nil {

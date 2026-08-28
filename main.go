@@ -62,6 +62,15 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 		fmt.Fprintf(stderr, "Помилка: %v\n", err)
 		return 2
 	}
+	sameFile, err := book.PathsReferToSameFile(cfg.BookFile, cfg.SaveFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "Помилка: не вдалося перевірити шляхи книги та прогресу: %v\n", err)
+		return 2
+	}
+	if sameFile {
+		fmt.Fprintln(stderr, "Помилка: файл книги та файл прогресу мають бути різними")
+		return 2
+	}
 	progressLease, err := progress.AcquireLease(cfg.SaveFile)
 	if err != nil {
 		if errors.Is(err, progress.ErrInUse) {

@@ -90,6 +90,55 @@ func TestRunEmptyBookDoesNotPrintNaN(t *testing.T) {
 	assertSavedPosition(t, save, 0)
 }
 
+func TestRunRejectsProgressPathEqualToBook(t *testing.T) {
+	book := filepath.Join(t.TempDir(), "book.txt")
+	mustWriteFile(t, book, "")
+
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", book, "-save", book}, &stdout, &stderr, testSpeaker(nil), false)
+
+	if code != 2 {
+		t.Fatalf("очікував exit code 2, отримав %d, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "мають бути різними") {
+		t.Fatalf("очікував помилку колізії шляхів, stderr=%q", stderr.String())
+	}
+	content, err := os.ReadFile(book)
+	if err != nil {
+		t.Fatalf("не вдалося прочитати книгу після відмови: %v", err)
+	}
+	if len(content) != 0 {
+		t.Fatalf("файл книги змінено: %q", content)
+	}
+}
+
+func TestRunRejectsProgressHardlinkToBook(t *testing.T) {
+	dir := t.TempDir()
+	book := filepath.Join(dir, "book.txt")
+	progressAlias := filepath.Join(dir, "progress.json")
+	mustWriteFile(t, book, "Аудіокнига")
+	if err := os.Link(book, progressAlias); err != nil {
+		t.Skipf("файлова система не підтримує hardlink: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions([]string{"-book", book, "-save", progressAlias}, &stdout, &stderr, testSpeaker(nil), false)
+
+	if code != 2 {
+		t.Fatalf("очікував exit code 2, отримав %d, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "мають бути різними") {
+		t.Fatalf("очікував помилку файлової ідентичності, stderr=%q", stderr.String())
+	}
+	content, err := os.ReadFile(book)
+	if err != nil {
+		t.Fatalf("не вдалося прочитати книгу після відмови: %v", err)
+	}
+	if string(content) != "Аудіокнига" {
+		t.Fatalf("файл книги змінено: %q", content)
+	}
+}
+
 func TestRunRejectsNegativeProgress(t *testing.T) {
 	dir := t.TempDir()
 	book := filepath.Join(dir, "book.txt")
