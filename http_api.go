@@ -164,7 +164,7 @@ func (api *LocalAPI) handleAddBook(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, err)
 		return
 	}
-	registeredBook, err := api.store.Add(book.AddRequest{
+	registeredBook, err := api.store.AddContext(r.Context(), book.AddRequest{
 		Path:  req.Path,
 		Title: req.Title,
 	})
@@ -199,7 +199,7 @@ func (api *LocalAPI) handleStartPlayback(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, book.ErrNotFound)
 		return
 	}
-	snapshot, err := api.playback.Start(registeredBook, req)
+	snapshot, err := api.playback.StartContext(r.Context(), registeredBook, req)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -261,7 +261,7 @@ func (api *LocalAPI) handleSetPosition(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, book.ErrNotFound)
 		return
 	}
-	snapshot, err := api.playback.SetPosition(registeredBook, pos)
+	snapshot, err := api.playback.SetPositionContext(r.Context(), registeredBook, pos)
 	if err != nil {
 		writeAPIError(w, err)
 		return

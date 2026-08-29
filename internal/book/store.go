@@ -1,6 +1,7 @@
 package book
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -67,6 +68,16 @@ func NewStoreWithProgressDir(progressDir string) *BookStore {
 }
 
 func (s *BookStore) Add(req AddRequest) (Book, error) {
+	return s.AddContext(context.Background(), req)
+}
+
+func (s *BookStore) AddContext(ctx context.Context, req AddRequest) (Book, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Book{}, err
+	}
 	if strings.TrimSpace(req.Path) == "" {
 		return Book{}, ErrPathRequired
 	}
@@ -75,8 +86,11 @@ func (s *BookStore) Add(req AddRequest) (Book, error) {
 	if err != nil {
 		return Book{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
-	identity, err := InspectFile(absPath)
+	identity, err := InspectFileContext(ctx, absPath)
 	if err != nil {
+		return Book{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return Book{}, err
 	}
 
@@ -197,23 +211,52 @@ func PathsReferToSameFile(firstPath string, secondPath string) (bool, error) {
 }
 
 func InspectFile(path string) (FileIdentity, error) {
+	return InspectFileContext(context.Background(), path)
+}
+
+func InspectFileContext(ctx context.Context, path string) (FileIdentity, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return FileIdentity{}, err
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
 	defer file.Close()
-	return inspectOpenFile(file)
+	stopInterrupt := interruptFileOnCancel(ctx, file)
+	defer stopInterrupt()
+	return inspectOpenFileContext(ctx, file)
 }
 
 // OpenStableRead відкриває книгу для playback і перевіряє fingerprint саме цього handle.
 func OpenStableRead(path string) (*os.File, FileIdentity, error) {
+	return OpenStableReadContext(context.Background(), path)
+}
+
+// OpenStableReadContext перериває обчислення fingerprint після скасування context.
+func OpenStableReadContext(ctx context.Context, path string) (*os.File, FileIdentity, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, FileIdentity{}, err
+	}
 	file, err := openStableRead(path)
 	if err != nil {
 		return nil, FileIdentity{}, fmt.Errorf("%w: %w", ErrNotReadable, err)
 	}
 
-	identity, err := inspectOpenFile(file)
+	stopInterrupt := interruptFileOnCancel(ctx, file)
+	identity, err := inspectOpenFileContext(ctx, file)
+	stopInterrupt()
 	if err != nil {
+		_ = file.Close()
+		return nil, FileIdentity{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		_ = file.Close()
 		return nil, FileIdentity{}, err
 	}
@@ -224,9 +267,18 @@ func OpenStableRead(path string) (*os.File, FileIdentity, error) {
 	return file, identity, nil
 }
 
-func inspectOpenFile(file *os.File) (FileIdentity, error) {
+func inspectOpenFileContext(ctx context.Context, file *os.File) (FileIdentity, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return FileIdentity{}, err
+	}
 	info, err := file.Stat()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return FileIdentity{}, ctxErr
+		}
 		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
 	if !info.Mode().IsRegular() {
@@ -234,12 +286,35 @@ func inspectOpenFile(file *os.File) (FileIdentity, error) {
 	}
 
 	hash := sha256.New()
-	bytesRead, err := io.Copy(hash, file)
-	if err != nil {
-		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
+	buffer := make([]byte, 128<<10)
+	var bytesRead int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return FileIdentity{}, err
+		}
+		read, readErr := file.Read(buffer)
+		if read > 0 {
+			_, _ = hash.Write(buffer[:read])
+			bytesRead += int64(read)
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return FileIdentity{}, ctxErr
+			}
+			return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, readErr)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return FileIdentity{}, err
 	}
 	afterRead, err := file.Stat()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return FileIdentity{}, ctxErr
+		}
 		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
 	}
 	if bytesRead != info.Size() || afterRead.Size() != info.Size() || !afterRead.ModTime().Equal(info.ModTime()) {
@@ -251,6 +326,28 @@ func inspectOpenFile(file *os.File) (FileIdentity, error) {
 		ModifiedAt:  afterRead.ModTime().UTC(),
 		Fingerprint: hex.EncodeToString(hash.Sum(nil)),
 	}, nil
+}
+
+// interruptFileOnCancel закриває handle, щоб розблокувати активне файлове читання.
+func interruptFileOnCancel(ctx context.Context, file *os.File) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+		case <-stop:
+		}
+	}()
+	return func() {
+		close(stop)
+		<-stopped
+	}
 }
 
 func SameFile(registered FileIdentity, current FileIdentity) bool {

@@ -129,6 +129,8 @@ paths:
           $ref: "#/components/responses/Error"
         "415":
           $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
     get:
@@ -256,6 +258,8 @@ paths:
         "403":
           $ref: "#/components/responses/Error"
         "415":
+          $ref: "#/components/responses/Error"
+        "500":
           $ref: "#/components/responses/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"

@@ -108,7 +108,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 		}
 	}()
 
-	bookIdentity, err := book.InspectFile(cfg.BookFile)
+	bookIdentity, err := book.InspectFileContext(app.ctx, cfg.BookFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося прочитати файл книги %q: %v\n", cfg.BookFile, err)
 		return 1
@@ -154,7 +154,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 	fmt.Fprintln(stdout, "Ctrl+C для виходу.")
 	fmt.Fprintln(stdout, "------------------------------------------------")
 
-	bookFile, stableIdentity, err := book.OpenStableRead(cfg.BookFile)
+	bookFile, stableIdentity, err := book.OpenStableReadContext(app.ctx, cfg.BookFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: не вдалося відкрити файл книги %q: %v\n", cfg.BookFile, err)
 		return 1
@@ -235,7 +235,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 		}
 	}
 
-	currentBook, err := book.InspectFile(cfg.BookFile)
+	currentBook, err := book.InspectFileContext(app.ctx, cfg.BookFile)
 	if err != nil || !book.SameFile(app.book, currentBook) {
 		pos := app.pos.Load()
 		if err != nil {

@@ -151,5 +151,4 @@ jobs:
 
           gh release upload $tag `
             dist/tts-reader-windows-amd64.exe `
-            dist/tts-reader-windows-amd64.exe.sha256 `
-            --clobber
+            dist/tts-reader-windows-amd64.exe.sha256

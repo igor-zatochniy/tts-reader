@@ -908,6 +908,55 @@ func TestFinishFailsWhenProgressResetClearsSession(t *testing.T) {
 	}
 }
 
+func TestStartContextHonorsCancellation(t *testing.T) {
+	registeredBook := mustBook(t, writeTempBook(t, strings.Repeat("Текст книги. ", 128)))
+	manager := NewManager(
+		func(tts.Config) tts.Engine { return &testEngine{} },
+		time.Second,
+		NewEventBroker(),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := manager.StartContext(ctx, registeredBook, StartRequest{BookID: registeredBook.ID})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("очікувалася context.Canceled, отримано %v", err)
+	}
+	manager.mu.Lock()
+	active := manager.active
+	manager.mu.Unlock()
+	if active != nil {
+		t.Fatal("скасований Start залишив активну сесію")
+	}
+	if snapshot := manager.Snapshot(); snapshot.State != Stopped {
+		t.Fatalf("скасований Start змінив стан: %#v", snapshot)
+	}
+}
+
+func TestSetPositionContextHonorsCancellation(t *testing.T) {
+	registeredBook := mustBook(t, writeTempBook(t, strings.Repeat("Текст книги. ", 128)))
+	store := &trackingProgressStore{}
+	manager := NewManagerWithProgress(
+		func(tts.Config) tts.Engine { return &testEngine{} },
+		time.Second,
+		NewEventBroker(),
+		store,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := manager.SetPositionContext(ctx, registeredBook, 0)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("очікувалася context.Canceled, отримано %v", err)
+	}
+	if len(store.saved) != 0 {
+		t.Fatalf("скасований SetPosition записав progress: %v", store.saved)
+	}
+	if snapshot := manager.Snapshot(); snapshot.State != Stopped {
+		t.Fatalf("скасований SetPosition змінив стан: %#v", snapshot)
+	}
+}
+
 type testEngine struct {
 	speakContext func(ctx context.Context, text string) error
 	stop         func(ctx context.Context) error

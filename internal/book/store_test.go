@@ -1,11 +1,54 @@
 package book
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestInspectFileContextHonorsCancellation(t *testing.T) {
+	bookPath := writeBook(t, strings.Repeat("Текст книги. ", 128))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := InspectFileContext(ctx, bookPath)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("очікувалася context.Canceled, отримано %v", err)
+	}
+}
+
+func TestOpenStableReadContextHonorsCancellation(t *testing.T) {
+	bookPath := writeBook(t, strings.Repeat("Текст книги. ", 128))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	file, _, err := OpenStableReadContext(ctx, bookPath)
+	if file != nil {
+		_ = file.Close()
+		t.Fatal("скасована операція не повинна повертати відкритий файл")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("очікувалася context.Canceled, отримано %v", err)
+	}
+}
+
+func TestBookStoreAddContextHonorsCancellation(t *testing.T) {
+	bookPath := writeBook(t, strings.Repeat("Текст книги. ", 128))
+	store := NewStoreWithProgressDir(filepath.Join(t.TempDir(), "progress"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := store.AddContext(ctx, AddRequest{Path: bookPath})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("очікувалася context.Canceled, отримано %v", err)
+	}
+	if got := len(store.List()); got != 0 {
+		t.Fatalf("скасована реєстрація змінила store: %d", got)
+	}
+}
 
 func TestBookStoreDeduplicatesCanonicalPath(t *testing.T) {
 	bookPath := writeBook(t, "Початковий текст")

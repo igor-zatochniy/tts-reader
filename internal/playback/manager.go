@@ -207,6 +207,16 @@ func newManagerWithEventStream(engines EngineFactory, ttsTimeout time.Duration, 
 }
 
 func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSnapshot, error) {
+	return m.StartContext(context.Background(), book, req)
+}
+
+func (m *PlaybackManager) StartContext(opCtx context.Context, book bookpkg.Book, req StartRequest) (PlaybackSnapshot, error) {
+	if opCtx == nil {
+		opCtx = context.Background()
+	}
+	if err := opCtx.Err(); err != nil {
+		return PlaybackSnapshot{}, err
+	}
 	m.controlMu.Lock()
 	defer m.controlMu.Unlock()
 
@@ -229,7 +239,7 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 	}
 	m.mu.Unlock()
 
-	currentFile, err := bookpkg.InspectFile(book.Path)
+	currentFile, err := bookpkg.InspectFileContext(opCtx, book.Path)
 	if err != nil {
 		return PlaybackSnapshot{}, fmt.Errorf("inspect current book file: %w", err)
 	}
@@ -252,6 +262,9 @@ func (m *PlaybackManager) Start(book bookpkg.Book, req StartRequest) (PlaybackSn
 
 	startPos, err := m.progress.Load(book, currentFile.Size)
 	if err != nil {
+		return PlaybackSnapshot{}, err
+	}
+	if err := opCtx.Err(); err != nil {
 		return PlaybackSnapshot{}, err
 	}
 	if m.shuttingDown.Load() {
@@ -438,6 +451,16 @@ func (m *PlaybackManager) waitForSessionStop(ctx context.Context, session *playb
 }
 
 func (m *PlaybackManager) SetPosition(book bookpkg.Book, pos int64) (PlaybackSnapshot, error) {
+	return m.SetPositionContext(context.Background(), book, pos)
+}
+
+func (m *PlaybackManager) SetPositionContext(opCtx context.Context, book bookpkg.Book, pos int64) (PlaybackSnapshot, error) {
+	if opCtx == nil {
+		opCtx = context.Background()
+	}
+	if err := opCtx.Err(); err != nil {
+		return PlaybackSnapshot{}, err
+	}
 	m.controlMu.Lock()
 	defer m.controlMu.Unlock()
 
@@ -458,7 +481,7 @@ func (m *PlaybackManager) SetPosition(book bookpkg.Book, pos int64) (PlaybackSna
 	}
 	m.mu.Unlock()
 
-	currentFile, err := bookpkg.InspectFile(book.Path)
+	currentFile, err := bookpkg.InspectFileContext(opCtx, book.Path)
 	if err != nil {
 		return PlaybackSnapshot{}, fmt.Errorf("inspect current book file: %w", err)
 	}
@@ -477,6 +500,9 @@ func (m *PlaybackManager) SetPosition(book bookpkg.Book, pos int64) (PlaybackSna
 	}
 	if !ok {
 		return PlaybackSnapshot{}, progress.ErrPositionInside
+	}
+	if err := opCtx.Err(); err != nil {
+		return PlaybackSnapshot{}, err
 	}
 	progressLease, err := progress.AcquireLease(book.SaveFile)
 	if err != nil {
@@ -528,8 +554,11 @@ func (m *PlaybackManager) play(session *playbackSession, book bookpkg.Book, star
 }
 
 func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Book, startPos int64, chunkSize int) sessionResult {
-	file, stableIdentity, err := bookpkg.OpenStableRead(book.Path)
+	file, stableIdentity, err := bookpkg.OpenStableReadContext(session.ctx, book.Path)
 	if err != nil {
+		if session.ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return sessionResult{state: Stopped, position: startPos}
+		}
 		return sessionResult{state: Failed, position: startPos, err: err}
 	}
 	defer file.Close()
@@ -559,7 +588,10 @@ func (m *PlaybackManager) runPlayback(session *playbackSession, book bookpkg.Boo
 		chunk, err := reader.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				if err := validatePlaybackBookUnchanged(book); err != nil {
+				if err := validatePlaybackBookUnchanged(session.ctx, book); err != nil {
+					if session.ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return sessionResult{state: Stopped, position: durablePosition}
+					}
 					return sessionResult{state: Failed, position: durablePosition, err: err}
 				}
 				return sessionResult{state: Finished, position: book.Size}
@@ -609,8 +641,8 @@ func validatePlaybackBookMetadata(file *os.File, expected bookpkg.FileIdentity) 
 	return nil
 }
 
-func validatePlaybackBookUnchanged(book bookpkg.Book) error {
-	currentFile, err := bookpkg.InspectFile(book.Path)
+func validatePlaybackBookUnchanged(ctx context.Context, book bookpkg.Book) error {
+	currentFile, err := bookpkg.InspectFileContext(ctx, book.Path)
 	if err != nil {
 		return fmt.Errorf("%w: revalidate book after playback: %v", bookpkg.ErrModified, err)
 	}
