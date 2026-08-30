@@ -789,7 +789,12 @@ func TestConcurrentStartAndSetPositionMaintainsConsistentState(t *testing.T) {
 			t.Fatalf("invalid state: active session with stopped state")
 		}
 
-		_, _ = manager.Stop(context.Background())
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), 2*time.Second)
+		_, stopErr := manager.Stop(stopCtx)
+		cancelStop()
+		if stopErr != nil {
+			t.Fatalf("Stop завис після конкурентного Start/SetPosition: %v", stopErr)
+		}
 	}
 }
 

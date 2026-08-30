@@ -221,14 +221,19 @@ func InspectFileContext(ctx context.Context, path string) (FileIdentity, error) 
 	if err := ctx.Err(); err != nil {
 		return FileIdentity{}, err
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
-	}
-	defer file.Close()
-	stopInterrupt := interruptFileOnCancel(ctx, file)
-	defer stopInterrupt()
-	return inspectOpenFileContext(ctx, file)
+	_, identity, err := inspectOwnedFileContext(
+		ctx,
+		func() (*os.File, error) {
+			file, err := os.Open(path)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrNotReadable, err)
+			}
+			return file, nil
+		},
+		inspectOpenFileContext,
+		false,
+	)
+	return identity, err
 }
 
 // OpenStableRead відкриває книгу для playback і перевіряє fingerprint саме цього handle.
@@ -236,7 +241,7 @@ func OpenStableRead(path string) (*os.File, FileIdentity, error) {
 	return OpenStableReadContext(context.Background(), path)
 }
 
-// OpenStableReadContext перериває обчислення fingerprint після скасування context.
+// OpenStableReadContext повертається після скасування context, не закриваючи handle конкурентно з читанням.
 func OpenStableReadContext(ctx context.Context, path string) (*os.File, FileIdentity, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -244,27 +249,80 @@ func OpenStableReadContext(ctx context.Context, path string) (*os.File, FileIden
 	if err := ctx.Err(); err != nil {
 		return nil, FileIdentity{}, err
 	}
-	file, err := openStableRead(path)
-	if err != nil {
-		return nil, FileIdentity{}, fmt.Errorf("%w: %w", ErrNotReadable, err)
-	}
+	return inspectOwnedFileContext(
+		ctx,
+		func() (*os.File, error) {
+			file, err := openStableRead(path)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrNotReadable, err)
+			}
+			return file, nil
+		},
+		inspectOpenFileContext,
+		true,
+	)
+}
 
-	stopInterrupt := interruptFileOnCancel(ctx, file)
-	identity, err := inspectOpenFileContext(ctx, file)
-	stopInterrupt()
-	if err != nil {
-		_ = file.Close()
-		return nil, FileIdentity{}, err
+type fileInspectionResult struct {
+	file     *os.File
+	identity FileIdentity
+	err      error
+}
+
+// inspectOwnedFileContext залишає відкриття, читання та закриття handle одній goroutine.
+func inspectOwnedFileContext(
+	ctx context.Context,
+	openFile func() (*os.File, error),
+	inspectFile func(context.Context, *os.File) (FileIdentity, error),
+	keepOpen bool,
+) (*os.File, FileIdentity, error) {
+	results := make(chan fileInspectionResult)
+	go func() {
+		result := fileInspectionResult{}
+		result.file, result.err = openFile()
+		if result.err == nil {
+			if err := ctx.Err(); err != nil {
+				result.err = err
+			} else {
+				result.identity, result.err = inspectFile(ctx, result.file)
+			}
+		}
+		if result.err == nil && keepOpen {
+			if _, err := result.file.Seek(0, io.SeekStart); err != nil {
+				result.err = fmt.Errorf("%w: %v", ErrNotReadable, err)
+			}
+		}
+		if result.err == nil {
+			result.err = ctx.Err()
+		}
+		if result.err != nil || !keepOpen {
+			if result.file != nil {
+				_ = result.file.Close()
+				result.file = nil
+			}
+		}
+
+		select {
+		case results <- result:
+		case <-ctx.Done():
+			if result.file != nil {
+				_ = result.file.Close()
+			}
+		}
+	}()
+
+	select {
+	case result := <-results:
+		if err := ctx.Err(); err != nil {
+			if result.file != nil {
+				_ = result.file.Close()
+			}
+			return nil, FileIdentity{}, err
+		}
+		return result.file, result.identity, result.err
+	case <-ctx.Done():
+		return nil, FileIdentity{}, ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
-		_ = file.Close()
-		return nil, FileIdentity{}, err
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		_ = file.Close()
-		return nil, FileIdentity{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
-	}
-	return file, identity, nil
 }
 
 func inspectOpenFileContext(ctx context.Context, file *os.File) (FileIdentity, error) {
@@ -326,28 +384,6 @@ func inspectOpenFileContext(ctx context.Context, file *os.File) (FileIdentity, e
 		ModifiedAt:  afterRead.ModTime().UTC(),
 		Fingerprint: hex.EncodeToString(hash.Sum(nil)),
 	}, nil
-}
-
-// interruptFileOnCancel закриває handle, щоб розблокувати активне файлове читання.
-func interruptFileOnCancel(ctx context.Context, file *os.File) func() {
-	if ctx.Done() == nil {
-		return func() {}
-	}
-
-	stop := make(chan struct{})
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		select {
-		case <-ctx.Done():
-			_ = file.Close()
-		case <-stop:
-		}
-	}()
-	return func() {
-		close(stop)
-		<-stopped
-	}
 }
 
 func SameFile(registered FileIdentity, current FileIdentity) bool {

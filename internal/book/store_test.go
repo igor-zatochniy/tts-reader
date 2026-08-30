@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInspectFileContextHonorsCancellation(t *testing.T) {
@@ -32,6 +33,58 @@ func TestOpenStableReadContextHonorsCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("очікувалася context.Canceled, отримано %v", err)
+	}
+}
+
+func TestOwnedFileInspectionCancellationDoesNotWaitForWorker(t *testing.T) {
+	bookPath := writeBook(t, "Текст книги.")
+	ctx, cancel := context.WithCancel(context.Background())
+	inspectionStarted := make(chan struct{})
+	releaseInspection := make(chan struct{})
+	workerReturned := make(chan struct{})
+
+	result := make(chan error, 1)
+	go func() {
+		file, _, err := inspectOwnedFileContext(
+			ctx,
+			func() (*os.File, error) {
+				return os.Open(bookPath)
+			},
+			func(_ context.Context, _ *os.File) (FileIdentity, error) {
+				close(inspectionStarted)
+				<-releaseInspection
+				close(workerReturned)
+				return FileIdentity{}, nil
+			},
+			true,
+		)
+		if file != nil {
+			_ = file.Close()
+		}
+		result <- err
+	}()
+
+	select {
+	case <-inspectionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("worker не розпочав перевірку файла")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("очікувалася context.Canceled, отримано %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("скасована перевірка чекає заблокований worker")
+	}
+
+	close(releaseInspection)
+	select {
+	case <-workerReturned:
+	case <-time.After(time.Second):
+		t.Fatal("worker не завершив перевірку після розблокування")
 	}
 }
 
