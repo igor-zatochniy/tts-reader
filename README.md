@@ -43,6 +43,9 @@ Next chunk
 - Windows 10/11.
 - Go 1.26.7 або сумісний patched toolchain.
 - PowerShell із доступом до `System.Speech`.
+- Книги на локальному fixed disk або RAM disk. UNC, mapped network drives, device paths та знімні носії не підтримуються; мережеву книгу спочатку потрібно перенести на локальний диск.
+
+Перевірка fingerprint скасовується через context. Якщо драйвер завис усередині файлового I/O, caller повертається після скасування, але worker закриє handle лише після повернення I/O. Одночасно допускається не більше чотирьох inspection workers; очікування вільного slot також можна скасувати. Це не гарантія примусового переривання несправного драйвера.
 
 ## Releases
 
@@ -59,6 +62,8 @@ Workflow `.github/workflows/release.yml` збирає Windows amd64 binary і д
 tts-reader-windows-amd64.exe
 tts-reader-windows-amd64.exe.sha256
 ```
+
+Публікація відбувається через `draft → upload → download/verify → publish`. Workflow перевіряє SHA256 обох завантажених артефактів і відповідність remote tag перевіреному commit. Збій upload залишає чернетку; rerun може замінювати файли лише в чернетці. Уже опублікований Release перевіряється без зміни його assets; для іншої збірки потрібен новий tag `vMAJOR.MINOR.PATCH`.
 
 Перевірка checksum після завантаження:
 
@@ -281,13 +286,28 @@ go test -run '^$' -fuzz=FuzzProgressLoad -fuzztime=10s
 go test -run '^$' -fuzz=FuzzStartPosition -fuzztime=10s
 ```
 
-Довший локальний прогін перед релізом:
+Довший локальний прогін перед релізом, по дві хвилини на кожен target:
 
 ```powershell
 go test -run '^$' -fuzz=FuzzChunkReader -fuzztime=2m
+go test -run '^$' -fuzz=FuzzUTF8Boundary -fuzztime=2m
+go test -run '^$' -fuzz=FuzzProgressLoad -fuzztime=2m
+go test -run '^$' -fuzz=FuzzStartPosition -fuzztime=2m
 ```
 
 Основні інваріанти: chunks відновлюють оригінальний валідний UTF-8 текст, кожен chunk валідний UTF-8, фінальна byte-позиція дорівнює розміру вхідного тексту, а відновлена позиція прогресу не потрапляє всередину UTF-8 символу і належить саме поточній книзі.
+
+## Windows Desktop acceptance
+
+Звичайні unit-тести не потребують аудіопристрою. Перед заморожуванням релізу в інтерактивній Windows 10/11-сесії окремо виконується opt-in перевірка:
+
+```powershell
+$env:RUN_WINDOWS_SAPI_SMOKE = '1'
+go test . -run '^TestWindowsSAPI.*Smoke$' -count=1 -v -timeout=2m
+Remove-Item Env:RUN_WINDOWS_SAPI_SMOKE
+```
+
+Вона запускає discovery, реальний Unicode Speak, невідомий голос, timeout, а також Stop після ініціалізації SAPI другого chunk. Тест перевіряє завершення PowerShell і збереження останньої durable byte-позиції. Буде відтворюватися звук; його чутність на потрібному пристрої перевіряє користувач. Hosted CI не замінює цю desktop-перевірку.
 
 ## Benchmarks і profiling
 
@@ -334,7 +354,7 @@ GitHub Actions workflow у `.github/workflows/ci.yml` запускається �
 
 Окремий playback stress gate 30 разів запускає `internal/playback` та `internal/events` під race detector і перевіряє state/active invariants, single-owner finalization та порядок terminal SSE events.
 
-Release workflow у `.github/workflows/release.yml` запускається на tags `v*`, збирає `tts-reader-windows-amd64.exe`, створює SHA256 checksum і публікує обидва артефакти в GitHub Release.
+Release workflow у `.github/workflows/release.yml` запускається на tags `v*`. Публікація залежить від verify, full-history secret scan і Windows fuzz matrix: усі чотири targets виконуються по дві хвилини на тому самому commit. Verify додатково запускає shuffled tests. CI та release gate перевіряють recovery публікації через `pwsh -NoProfile -File scripts/Test-PublishRelease.ps1` без звернень до GitHub.
 
 ## Файли користувача
 

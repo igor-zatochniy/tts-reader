@@ -20,7 +20,11 @@ var (
 	ErrNotReadable  = errors.New("book not readable")
 	ErrNotRegular   = errors.New("book must be a regular file")
 	ErrPathRequired = errors.New("path required")
+	ErrNotLocal     = errors.New("book must be on a local fixed disk")
 )
+
+// Скасований kernel I/O може ще виконуватися; його slot звільняє лише власник handle.
+var inspectionSlots = make(chan struct{}, 4)
 
 type Book struct {
 	ID        string       `json:"-"`
@@ -167,6 +171,9 @@ func progressPathInDir(dir string, bookPath string) string {
 }
 
 func canonicalBookPath(path string) (string, string, error) {
+	if err := ValidateLocalPath(path); err != nil {
+		return "", "", err
+	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return "", "", err
@@ -174,6 +181,9 @@ func canonicalBookPath(path string) (string, string, error) {
 	absPath = filepath.Clean(absPath)
 	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
 		absPath = filepath.Clean(resolved)
+	}
+	if err := ValidateLocalPath(absPath); err != nil {
+		return "", "", err
 	}
 	key := canonicalPathKey(absPath)
 	return absPath, key, nil
@@ -221,6 +231,9 @@ func InspectFileContext(ctx context.Context, path string) (FileIdentity, error) 
 	if err := ctx.Err(); err != nil {
 		return FileIdentity{}, err
 	}
+	if err := ValidateLocalPath(path); err != nil {
+		return FileIdentity{}, err
+	}
 	_, identity, err := inspectOwnedFileContext(
 		ctx,
 		func() (*os.File, error) {
@@ -247,6 +260,9 @@ func OpenStableReadContext(ctx context.Context, path string) (*os.File, FileIden
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, FileIdentity{}, err
+	}
+	if err := ValidateLocalPath(path); err != nil {
 		return nil, FileIdentity{}, err
 	}
 	return inspectOwnedFileContext(
@@ -276,10 +292,19 @@ func inspectOwnedFileContext(
 	inspectFile func(context.Context, *os.File) (FileIdentity, error),
 	keepOpen bool,
 ) (*os.File, FileIdentity, error) {
+	select {
+	case inspectionSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, FileIdentity{}, ctx.Err()
+	}
 	results := make(chan fileInspectionResult)
 	go func() {
+		defer func() { <-inspectionSlots }()
 		result := fileInspectionResult{}
-		result.file, result.err = openFile()
+		result.err = ctx.Err()
+		if result.err == nil {
+			result.file, result.err = openFile()
+		}
 		if result.err == nil {
 			if err := ctx.Err(); err != nil {
 				result.err = err
@@ -341,6 +366,9 @@ func inspectOpenFileContext(ctx context.Context, file *os.File) (FileIdentity, e
 	}
 	if !info.Mode().IsRegular() {
 		return FileIdentity{}, ErrNotRegular
+	}
+	if err := validateOpenedFileLocation(file); err != nil {
+		return FileIdentity{}, err
 	}
 
 	hash := sha256.New()

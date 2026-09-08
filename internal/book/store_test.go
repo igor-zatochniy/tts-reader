@@ -103,6 +103,68 @@ func TestBookStoreAddContextHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestCancelledInspectionsKeepWorkersBoundedAndReleaseHandles(t *testing.T) {
+	path := writeBook(t, "Книга для перевірки обмеження workers.")
+	release := make(chan struct{})
+	started := make(chan *os.File, cap(inspectionSlots))
+	var files []*os.File
+	defer func() {
+		close(release)
+		deadline := time.Now().Add(3 * time.Second)
+		for len(inspectionSlots) != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if len(inspectionSlots) != 0 {
+			t.Error("workers не звільнили slots після повернення I/O")
+		}
+		for _, file := range files {
+			if _, err := file.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+				t.Errorf("worker залишив відкритий handle: %v", err)
+			}
+		}
+	}()
+	for range cap(inspectionSlots) {
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() {
+			_, _, err := inspectOwnedFileContext(ctx, func() (*os.File, error) { return os.Open(path) },
+				func(_ context.Context, file *os.File) (FileIdentity, error) {
+					started <- file
+					<-release
+					return FileIdentity{}, nil
+				}, true)
+			result <- err
+		}()
+		select {
+		case file := <-started:
+			files = append(files, file)
+		case <-time.After(time.Second):
+			cancel()
+			t.Fatal("worker не стартував")
+		}
+		cancel()
+		select {
+		case err := <-result:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("неочікувана помилка скасування: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("caller чекає заблокований I/O")
+		}
+	}
+	for range 20 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		_, _, err := inspectOwnedFileContext(ctx, func() (*os.File, error) {
+			t.Error("перевищено ліміт inspection workers")
+			return nil, os.ErrInvalid
+		}, inspectOpenFileContext, false)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("очікування slot не скасовано: %v", err)
+		}
+	}
+}
+
 func TestBookStoreDeduplicatesCanonicalPath(t *testing.T) {
 	bookPath := writeBook(t, "Початковий текст")
 	store := NewStoreWithProgressDir(filepath.Join(t.TempDir(), "progress"))

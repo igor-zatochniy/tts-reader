@@ -105,7 +105,7 @@ func (e PlaybackStateState) Valid() bool {
 
 // AddBookRequest defines model for AddBookRequest.
 type AddBookRequest struct {
-	// Path Absolute or relative local path to a UTF-8 text file.
+	// Path Absolute or relative path to a UTF-8 text file on a local Windows fixed or RAM disk. UNC paths, mapped network drives, device paths and removable drives are not supported.
 	//
 	// Example: C:\Books\novel.txt
 	Path string `json:"path"`

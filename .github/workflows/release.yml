@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   scan-secrets:
     runs-on: ubuntu-latest
@@ -72,8 +76,15 @@ jobs:
       - name: Verify modules
         run: go mod verify
 
+      - name: Test release publication recovery
+        shell: pwsh
+        run: ./scripts/Test-PublishRelease.ps1
+
       - name: Test
         run: go test ./...
+
+      - name: Shuffled tests
+        run: go test -count=1 -shuffle=on ./...
 
       - name: Race test
         run: go test -race ./...
@@ -99,8 +110,28 @@ jobs:
       - name: Build
         run: go build ./...
 
+  fuzz:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzChunkReader, FuzzUTF8Boundary, FuzzProgressLoad, FuzzStartPosition]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Coverage-guided fuzzing
+        run: go test . -run '^$' -fuzz='^${{ matrix.target }}$' -fuzztime=2m -parallel=2 -timeout=10m
+
   publish:
-    needs: [verify, scan-secrets]
+    needs: [verify, scan-secrets, fuzz]
     runs-on: windows-latest
     permissions:
       contents: write
@@ -118,6 +149,9 @@ jobs:
 
       - name: Build Windows executable
         shell: pwsh
+        env:
+          GOOS: windows
+          GOARCH: amd64
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           go build -trimpath -ldflags "-s -w" -o dist/tts-reader-windows-amd64.exe .
@@ -134,21 +168,4 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          $tag = $env:GITHUB_REF_NAME
-          $notes = @(
-            "Windows amd64 build for Audiobook TTS Reader.",
-            "",
-            "Assets:",
-            "- tts-reader-windows-amd64.exe",
-            "- tts-reader-windows-amd64.exe.sha256"
-          ) -join [Environment]::NewLine
-
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title $tag --notes $notes
-          }
-
-          gh release upload $tag `
-            dist/tts-reader-windows-amd64.exe `
-            dist/tts-reader-windows-amd64.exe.sha256
+        run: ./scripts/Publish-Release.ps1 -Repository $env:GITHUB_REPOSITORY -Tag $env:GITHUB_REF_NAME -Commit $env:GITHUB_SHA

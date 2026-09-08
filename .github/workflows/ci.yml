@@ -71,6 +71,10 @@ jobs:
       - name: Verify modules
         run: go mod verify
 
+      - name: Test release publication recovery
+        shell: pwsh
+        run: ./scripts/Test-PublishRelease.ps1
+
       - name: Test
         run: go test ./...
 

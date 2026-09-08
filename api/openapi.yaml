@@ -341,7 +341,7 @@ components:
       properties:
         path:
           type: string
-          description: Absolute or relative local path to a UTF-8 text file.
+          description: Absolute or relative path to a UTF-8 text file on a local Windows fixed or RAM disk. UNC paths, mapped network drives, device paths and removable drives are not supported.
           example: "C:\\Books\\novel.txt"
         title:
           type: string
