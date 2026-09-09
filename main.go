@@ -271,6 +271,9 @@ func parseConfig(args []string, output io.Writer) (tts.Config, error) {
 	if err := fs.Parse(args); err != nil {
 		return tts.Config{}, err
 	}
+	if fs.NArg() != 0 {
+		return tts.Config{}, fmt.Errorf("неочікувані аргументи: %v", fs.Args())
+	}
 	if err := chunk.ValidateSize(cfg.ChunkSize); err != nil {
 		return tts.Config{}, fmt.Errorf("значення -chunk має бути між 1 і %d: %w", chunk.MaxSize, err)
 	}

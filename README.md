@@ -277,6 +277,8 @@ go build ./...
 - `FuzzProgressLoad` — corrupted JSON progress і відновлення позиції.
 - `FuzzStartPosition` — streaming-пошук стартової фрази.
 
+`FuzzProgressLoad` для кожного input створює UTF-8 книгу та отримує її справжні size, mtime і SHA-256 через `InspectFile`. Спершу він обов'язково перевіряє точне відновлення byte-позиції та reset на EOF через `ProgressForBook`; після цього окремо перевіряє сирий JSON, не виправляючи його identity-поля. Помилка valid-restore branch завершує тест невдачею, а не раннім пропуском.
+
 Швидкий smoke-run:
 
 ```powershell

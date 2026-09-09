@@ -33,6 +33,42 @@ func TestRunMissingBookReturnsFailure(t *testing.T) {
 	}
 }
 
+func TestRunRejectsUnexpectedPositionalArguments(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"unknown_subcommand", []string{"typo"}},
+		{"legacy", []string{"-book", "unused.txt", "unexpected"}},
+		{"read", []string{"read", "-book", "unused.txt", "unexpected"}},
+		{"serve", []string{"serve", "-addr", "127.0.0.1:0", "unexpected"}},
+		{"before_flags", []string{"read", "unexpected", "-chunk", "1"}},
+		{"after_delimiter", []string{"serve", "--", "unexpected"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Перевірка parser перед run запобігає запуску сервера при регресії.
+			var parseErr error
+			switch tc.args[0] {
+			case "serve":
+				_, parseErr = parseServeConfig(tc.args[1:], io.Discard)
+			case "read":
+				_, parseErr = parseConfig(tc.args[1:], io.Discard)
+			default:
+				_, parseErr = parseConfig(tc.args, io.Discard)
+			}
+			if parseErr == nil {
+				t.Fatal("parser прийняв неочікувані аргументи")
+			}
+			var stdout, stderr bytes.Buffer
+			code := runWithOptions(tc.args, &stdout, &stderr, testSpeaker(nil), false)
+			if code != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "неочікувані аргументи") {
+				t.Fatalf("очікував usage error без запуску читання: code=%d, stdout=%q, stderr=%q", code, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 func TestRunRejectsInvalidChunk(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 

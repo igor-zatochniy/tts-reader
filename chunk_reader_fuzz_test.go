@@ -2,11 +2,9 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -102,9 +100,11 @@ func FuzzUTF8Boundary(f *testing.F) {
 }
 
 func FuzzProgressLoad(f *testing.F) {
-	f.Add([]byte("Hello, world!"), mustProgressJSON(f, progressSeedForData([]byte("Hello, world!"), 0)))
-	f.Add([]byte("Аудіо"), mustProgressJSON(f, progressSeedForData([]byte("Аудіо"), 2)))
-	f.Add([]byte("Аудіо"), mustProgressJSON(f, progressSeedForData([]byte("Аудіо"), 1)))
+	f.Add([]byte("Hello, world!"), []byte{0})
+	f.Add([]byte("Аудіо"), []byte{1})
+	f.Add([]byte("Emoji 😀."), []byte{6})
+	f.Add([]byte{}, []byte(`{}`))
+	f.Add([]byte{0xff, 0x80, 'a'}, []byte{2})
 	f.Add([]byte("Hello"), []byte(`{"version":4,"last_position":-1,"position_unit":"bytes (UTF-8)"}`))
 	f.Add([]byte("Hello"), []byte(`not-json`))
 
@@ -113,27 +113,23 @@ func FuzzProgressLoad(f *testing.F) {
 			t.Skip("fuzz input is intentionally bounded for fast local runs")
 		}
 
-		dir := t.TempDir()
-		bookPath := filepath.Join(dir, "book.txt")
-		savePath := filepath.Join(dir, "progress.json")
-		if err := os.WriteFile(bookPath, bookData, 0644); err != nil {
-			t.Fatalf("failed to write fuzz book: %v", err)
+		// Валідне відновлення обов'язкове для кожного input, навіть якщо JSON пошкоджений.
+		bookData = bytes.ToValidUTF8(bookData, []byte("\uFFFD"))
+		app, progressBook := newProgressLoadFixture(t, bookData)
+		boundaries := []int64{0}
+		for offset := range string(bookData) {
+			if offset != 0 {
+				boundaries = append(boundaries, int64(offset))
+			}
 		}
-		if err := os.WriteFile(savePath, progressData, 0644); err != nil {
-			t.Fatalf("failed to write fuzz progress: %v", err)
-		}
+		var selector [8]byte
+		copy(selector[:], progressData)
+		position := boundaries[binary.LittleEndian.Uint64(selector[:])%uint64(len(boundaries))]
+		assertProgressRestore(t, app, progressBook, position)
+		assertProgressRestore(t, app, progressBook, progressBook.Size)
 
-		app := &App{
-			cfg:    tts.Config{BookFile: bookPath, SaveFile: savePath},
-			stdout: io.Discard,
-			stderr: io.Discard,
-		}
-		identity, err := bookpkg.InspectFile(bookPath)
-		if err != nil {
-			t.Fatalf("failed to inspect fuzz book: %v", err)
-		}
-		app.book = identity
-		pos, hasSave, err := app.loadProgress(identity)
+		// Сирий JSON перевіряємо окремо, без виправлення його identity-полів.
+		pos, hasSave, err := loadProgressData(t, app, progressData)
 		if err != nil {
 			return
 		}
@@ -146,11 +142,7 @@ func FuzzProgressLoad(f *testing.F) {
 		if pos < 0 || pos >= int64(len(bookData)) {
 			t.Fatalf("loaded position is outside readable range: %d of %d", pos, len(bookData))
 		}
-		ok, err := chunkpkg.IsFileUTF8Boundary(bookPath, pos, int64(len(bookData)))
-		if err != nil {
-			t.Fatalf("failed to recheck loaded boundary: %v", err)
-		}
-		if !ok {
+		if !utf8.Valid(bookData[:pos]) {
 			t.Fatalf("loaded position is inside UTF-8 rune: %d", pos)
 		}
 	})
@@ -244,29 +236,40 @@ func mustProgressJSON(t testing.TB, progress progresspkg.Progress) []byte {
 	return data
 }
 
-func progressSeedForData(data []byte, pos int64) progresspkg.Progress {
-	identity := bookIdentityForBytes(data)
-	return progresspkg.ProgressForBook(progresspkg.BookForProgress("book.txt", "progress.json", identity), pos)
+func newProgressLoadFixture(t *testing.T, data []byte) (*App, bookpkg.Book) {
+	t.Helper()
+	path := writeFuzzFile(t, data)
+	identity, err := bookpkg.InspectFile(path)
+	if err != nil {
+		t.Fatalf("не вдалося отримати реальну identity книги: %v", err)
+	}
+	savePath := filepath.Join(filepath.Dir(path), "progress.json")
+	return &App{
+		cfg:    tts.Config{BookFile: path, SaveFile: savePath},
+		book:   identity,
+		stdout: io.Discard,
+		stderr: io.Discard,
+	}, progresspkg.BookForProgress(path, savePath, identity)
 }
 
-func bookIdentityForBytes(data []byte) bookpkg.FileIdentity {
-	hash := sha256.New()
-	fmt.Fprintf(hash, "size:%d\n", len(data))
+func loadProgressData(t *testing.T, app *App, data []byte) (int64, bool, error) {
+	t.Helper()
+	if err := os.WriteFile(app.cfg.SaveFile, data, 0600); err != nil {
+		t.Fatalf("не вдалося записати progress fixture: %v", err)
+	}
+	return app.loadProgress(app.book)
+}
 
-	const sampleSize = 64 << 10
-	headSize := len(data)
-	if headSize > sampleSize {
-		headSize = sampleSize
+func assertProgressRestore(t *testing.T, app *App, progressBook bookpkg.Book, position int64) {
+	t.Helper()
+	p := progresspkg.ProgressForBook(progressBook, position)
+	got, hasSave, err := loadProgressData(t, app, mustProgressJSON(t, p))
+	wantPosition, wantSave := position, true
+	if position == progressBook.Size {
+		wantPosition, wantSave = 0, false
 	}
-	if headSize > 0 {
-		_, _ = hash.Write(data[:headSize])
-	}
-	if len(data) > sampleSize {
-		_, _ = hash.Write(data[len(data)-sampleSize:])
-	}
-
-	return bookpkg.FileIdentity{
-		Size:        int64(len(data)),
-		Fingerprint: hex.EncodeToString(hash.Sum(nil)),
+	if err != nil || got != wantPosition || hasSave != wantSave {
+		t.Fatalf("відновлення позиції %d: отримано (%d, %v, %v), очікувалося (%d, %v, nil)",
+			position, got, hasSave, err, wantPosition, wantSave)
 	}
 }

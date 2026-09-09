@@ -51,6 +51,9 @@ func parseServeConfig(args []string, output io.Writer) (ServeConfig, error) {
 	if err := fs.Parse(args); err != nil {
 		return ServeConfig{}, err
 	}
+	if fs.NArg() != 0 {
+		return ServeConfig{}, fmt.Errorf("неочікувані аргументи: %v", fs.Args())
+	}
 	if cfg.Addr == "" {
 		return ServeConfig{}, fmt.Errorf("значення -addr не може бути порожнім")
 	}
