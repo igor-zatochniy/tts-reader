@@ -33,6 +33,7 @@ type App struct {
 	stderr  io.Writer
 	ctx     context.Context
 	pos     atomic.Int64
+	canSave atomic.Bool
 	book    book.FileIdentity
 }
 
@@ -97,12 +98,14 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 		ctx:     ctx,
 	}
 
-	// Останній запобіжник для CLI: зберігаємо прогрес навіть після неочікуваної panic.
+	// Після panic зберігаємо позицію лише тоді, коли наявний progress уже перевірено.
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(stderr, "\n[КРИТИЧНА ПОМИЛКА] Паніка: %v\n", r)
-			if err := app.saveProgress(app.pos.Load()); err != nil {
-				fmt.Fprintf(stderr, "Помилка: не вдалося зберегти прогрес після паніки: %v\n", err)
+			if app.canSave.Load() {
+				if err := app.saveProgress(app.pos.Load()); err != nil {
+					fmt.Fprintf(stderr, "Помилка: не вдалося зберегти прогрес після паніки: %v\n", err)
+				}
 			}
 			exitCode = 1
 		}
@@ -114,6 +117,13 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 		return 1
 	}
 	app.book = bookIdentity
+	savedPos, hasSave, err := app.loadProgress(bookIdentity)
+	if err != nil {
+		fmt.Fprintf(stderr, "Помилка: %v\n", err)
+		return 1
+	}
+	app.pos.Store(savedPos)
+	app.canSave.Store(true)
 
 	bookSize := bookIdentity.Size
 	if bookSize == 0 {
@@ -128,7 +138,7 @@ func runWithOptions(args []string, stdout, stderr io.Writer, makeSpeaker tts.Spe
 		return 0
 	}
 
-	startPos, err := app.resolveStartPosition(bookSize)
+	startPos, err := app.resolveStartPosition(savedPos, hasSave)
 	if err != nil {
 		fmt.Fprintf(stderr, "Помилка: %v\n", err)
 		return 1
@@ -263,7 +273,7 @@ func parseConfig(args []string, output io.Writer) (tts.Config, error) {
 	cfg := tts.Config{}
 	fs.StringVar(&cfg.BookFile, "book", "book.txt", "Шлях до текстового файлу книги")
 	fs.StringVar(&cfg.SaveFile, "save", "", "Шлях до файлу прогресу")
-	fs.StringVar(&cfg.StartPhrase, "start", "", "Фраза для старту, яка ігнорує збережений прогрес")
+	fs.StringVar(&cfg.StartPhrase, "start", "", "Фраза для старту, яка ігнорує збережену позицію після перевірки progress")
 	fs.StringVar(&cfg.Voice, "voice", "", "Точна назва голосу Windows SAPI")
 	fs.IntVar(&cfg.ChunkSize, "chunk", chunk.DefaultSize, "Розмір фрагмента для озвучення у символах")
 	fs.DurationVar(&cfg.TTSTimeout, "tts-timeout", defaultTTSTimeout, "Максимальний час очікування одного TTS-фрагмента")
@@ -286,7 +296,7 @@ func parseConfig(args []string, output io.Writer) (tts.Config, error) {
 	return cfg, nil
 }
 
-func (a *App) resolveStartPosition(bookSize int64) (int64, error) {
+func (a *App) resolveStartPosition(savedPos int64, hasSave bool) (int64, error) {
 	if a.cfg.StartPhrase != "" {
 		fmt.Fprintf(a.stdout, "--- ПОШУК ФРАЗИ: %q ---\n", a.cfg.StartPhrase)
 		idx, found, err := chunk.FindPhraseOffset(a.cfg.BookFile, a.cfg.StartPhrase)
@@ -301,10 +311,6 @@ func (a *App) resolveStartPosition(bookSize int64) (int64, error) {
 		return idx, nil
 	}
 
-	savedPos, hasSave, err := a.loadProgress(a.book)
-	if err != nil {
-		return 0, err
-	}
 	if hasSave {
 		fmt.Fprintln(a.stdout, "--- ЗАВАНТАЖЕННЯ ПРОГРЕСУ ---")
 		return savedPos, nil

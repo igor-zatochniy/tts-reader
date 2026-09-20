@@ -126,6 +126,64 @@ func TestRunEmptyBookDoesNotPrintNaN(t *testing.T) {
 	assertSavedPosition(t, save, 0)
 }
 
+func TestRunEmptyBookRejectsMismatchedProgressWithoutOverwrite(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, string, string) string
+	}{
+		{
+			name: "інша книга",
+			setup: func(t *testing.T, dir string, save string) string {
+				firstBook := filepath.Join(dir, "first.txt")
+				emptyBook := filepath.Join(dir, "empty.txt")
+				mustWriteFile(t, firstBook, "Збережений прогрес першої книги.")
+				mustWriteFile(t, emptyBook, "")
+				mustWriteProgress(t, save, progressForPath(t, firstBook, save, int64(len("Зб"))))
+				return emptyBook
+			},
+		},
+		{
+			name: "та сама книга після скорочення",
+			setup: func(t *testing.T, dir string, save string) string {
+				book := filepath.Join(dir, "book.txt")
+				mustWriteFile(t, book, "Збережений прогрес книги.")
+				mustWriteProgress(t, save, progressForPath(t, book, save, int64(len("Зб"))))
+				mustWriteFile(t, book, "")
+				return book
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			save := filepath.Join(dir, "progress.json")
+			book := tc.setup(t, dir, save)
+			before, err := os.ReadFile(save)
+			if err != nil {
+				t.Fatalf("не вдалося прочитати початковий progress: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			code := runWithOptions([]string{"-book", book, "-save", save}, &stdout, &stderr, testSpeaker(nil), false)
+
+			if code != 1 {
+				t.Fatalf("очікував exit code 1, отримав %d, stdout=%q, stderr=%q", code, stdout.String(), stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "іншій книзі") {
+				t.Fatalf("очікував помилку несумісного progress, stderr=%q", stderr.String())
+			}
+			after, err := os.ReadFile(save)
+			if err != nil {
+				t.Fatalf("не вдалося прочитати progress після відмови: %v", err)
+			}
+			if !bytes.Equal(after, before) {
+				t.Fatalf("progress змінено після відмови:\nдо: %s\nпісля: %s", before, after)
+			}
+		})
+	}
+}
+
 func TestRunRejectsProgressPathEqualToBook(t *testing.T) {
 	book := filepath.Join(t.TempDir(), "book.txt")
 	mustWriteFile(t, book, "")
@@ -228,6 +286,88 @@ func TestRunRejectsProgressFromDifferentBook(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "іншій книзі") {
 		t.Fatalf("очікував помилку несумісного progress, stderr=%q", stderr.String())
+	}
+}
+
+func TestRunStartPhraseRejectsMismatchedProgressWithoutOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	firstBook := filepath.Join(dir, "first.txt")
+	secondBook := filepath.Join(dir, "second.txt")
+	save := filepath.Join(dir, "shared.progress.json")
+	mustWriteFile(t, firstBook, "Прогрес першої книги.")
+	mustWriteFile(t, secondBook, "Початок другої книги.")
+	mustWriteProgress(t, save, progressForPath(t, firstBook, save, int64(len("Пр"))))
+	before, err := os.ReadFile(save)
+	if err != nil {
+		t.Fatalf("не вдалося прочитати початковий progress: %v", err)
+	}
+
+	speakerCalls := 0
+	failingSpeaker := testSpeaker(func(string) error {
+		speakerCalls++
+		return errors.New("TTS не має запускатися")
+	})
+	var stdout, stderr bytes.Buffer
+	code := runWithOptions(
+		[]string{"-book", secondBook, "-save", save, "-start", "Початок"},
+		&stdout,
+		&stderr,
+		failingSpeaker,
+		false,
+	)
+
+	if code != 1 {
+		t.Fatalf("очікував exit code 1, отримав %d, stdout=%q, stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if speakerCalls != 0 {
+		t.Fatalf("TTS запущено до перевірки progress: %d викликів", speakerCalls)
+	}
+	if !strings.Contains(stderr.String(), "іншій книзі") {
+		t.Fatalf("очікував помилку несумісного progress, stderr=%q", stderr.String())
+	}
+	after, err := os.ReadFile(save)
+	if err != nil {
+		t.Fatalf("не вдалося прочитати progress після відмови: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("progress змінено після відмови:\nдо: %s\nпісля: %s", before, after)
+	}
+}
+
+type panicOutputWriter struct{}
+
+func (panicOutputWriter) Write([]byte) (int, error) {
+	panic("збій виведення до вибору стартової позиції")
+}
+
+func TestRunPanicBeforeStartSelectionPreservesSavedProgress(t *testing.T) {
+	for _, startPhrase := range []string{"", "Другий"} {
+		t.Run("start="+startPhrase, func(t *testing.T) {
+			dir := t.TempDir()
+			book := filepath.Join(dir, "book.txt")
+			save := filepath.Join(dir, "progress.json")
+			mustWriteFile(t, book, "Перший розділ. Другий розділ.")
+			pos := int64(len("Перший"))
+			mustWriteProgress(t, save, progressForPath(t, book, save, pos))
+			args := []string{"-book", book, "-save", save}
+			if startPhrase != "" {
+				args = append(args, "-start", startPhrase)
+			}
+
+			var stderr bytes.Buffer
+			speakerCalls := 0
+			code := runWithOptions(args, panicOutputWriter{}, &stderr, testSpeaker(func(string) error {
+				speakerCalls++
+				return nil
+			}), false)
+			if code != 1 || !strings.Contains(stderr.String(), "Паніка") {
+				t.Fatalf("очікував оброблену panic: code=%d, stderr=%q", code, stderr.String())
+			}
+			if speakerCalls != 0 {
+				t.Fatalf("TTS запущено до вибору стартової позиції: %d викликів", speakerCalls)
+			}
+			assertSavedPosition(t, save, pos)
+		})
 	}
 }
 
@@ -343,6 +483,7 @@ func TestRunUsesStartPhraseAndResetsProgressAfterSuccess(t *testing.T) {
 	book := filepath.Join(dir, "book.txt")
 	save := filepath.Join(dir, "save.json")
 	mustWriteFile(t, book, "Перший розділ. Другий розділ.")
+	mustWriteProgress(t, save, progressForPath(t, book, save, int64(len("Перший"))))
 
 	var spoken []string
 	speaker := testSpeaker(func(text string) error {
