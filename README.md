@@ -41,7 +41,7 @@ Next chunk
 ## Вимоги
 
 - Windows 10/11.
-- Go 1.26.7 або сумісний patched toolchain.
+- Go 1.26.9 або сумісний patched toolchain.
 - PowerShell із доступом до `System.Speech`.
 - Книги на локальному fixed disk або RAM disk. UNC, mapped network drives, device paths та знімні носії не підтримуються; мережеву книгу спочатку потрібно перенести на локальний диск.
 

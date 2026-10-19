@@ -131,8 +131,35 @@ type sessionResult struct {
 	err      error
 }
 
+// controlGate серіалізує команди з можливістю скасувати очікування без окремої goroutine.
+type controlGate chan struct{}
+
+func (g controlGate) Lock() {
+	g <- struct{}{}
+}
+
+func (g controlGate) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case g <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			g.Unlock()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g controlGate) Unlock() {
+	<-g
+}
+
 type PlaybackManager struct {
-	controlMu  sync.Mutex
+	controlMu  controlGate
 	mu         sync.Mutex
 	cond       *sync.Cond
 	engines    EngineFactory
@@ -195,6 +222,7 @@ func newManagerWithEventStream(engines EngineFactory, ttsTimeout time.Duration, 
 		events = NewEventBroker()
 	}
 	m := &PlaybackManager{
+		controlMu:  make(controlGate, 1),
 		engines:    engines,
 		ttsTimeout: ttsTimeout,
 		events:     events,
@@ -217,7 +245,9 @@ func (m *PlaybackManager) StartContext(opCtx context.Context, book bookpkg.Book,
 	if err := opCtx.Err(); err != nil {
 		return PlaybackSnapshot{}, err
 	}
-	m.controlMu.Lock()
+	if err := m.controlMu.LockContext(opCtx); err != nil {
+		return PlaybackSnapshot{}, err
+	}
 	defer m.controlMu.Unlock()
 
 	if m.shuttingDown.Load() {
@@ -378,7 +408,9 @@ func (m *PlaybackManager) Stop(ctx context.Context) (PlaybackSnapshot, error) {
 	// Після BeginShutdown нова сесія вже не може пройти фінальну перевірку Start.
 	// Це дозволяє Stop не чекати controlMu, зайнятий тривалим файловим I/O.
 	if !m.shuttingDown.Load() {
-		m.controlMu.Lock()
+		if err := m.controlMu.LockContext(ctx); err != nil {
+			return m.Snapshot(), err
+		}
 		defer m.controlMu.Unlock()
 	}
 
@@ -461,7 +493,9 @@ func (m *PlaybackManager) SetPositionContext(opCtx context.Context, book bookpkg
 	if err := opCtx.Err(); err != nil {
 		return PlaybackSnapshot{}, err
 	}
-	m.controlMu.Lock()
+	if err := m.controlMu.LockContext(opCtx); err != nil {
+		return PlaybackSnapshot{}, err
+	}
 	defer m.controlMu.Unlock()
 
 	if m.shuttingDown.Load() {

@@ -90,6 +90,7 @@ Root package лишається application layer:
 
 ### Stop
 
+- Очікування черги керування у `StartContext`, `SetPositionContext` та `Stop` враховує скасування context; прострочений запит не змінює стан після звільнення черги.
 - `Stop` переводить сесію у `stopping`, скасовує session context і викликає `TTSEngine.Stop(...)` лише один раз.
 - `Stop` не очищає `active` і не створює terminal snapshot: цим одноосібно володіє session finalizer.
 - Finalizer зберігає durable position, атомарно очищає `active`, встановлює `lastErr`, формує snapshot і публікує `playback.stopped`.

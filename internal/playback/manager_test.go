@@ -528,6 +528,127 @@ func TestPlaybackManagerRejectsStartAfterBeginShutdown(t *testing.T) {
 	}
 }
 
+func TestControlOperationsHonorContextWhileStartLoads(t *testing.T) {
+	operations := []struct {
+		name string
+		run  func(context.Context, *PlaybackManager, book.Book) (PlaybackSnapshot, error)
+	}{
+		{"stop", func(ctx context.Context, manager *PlaybackManager, _ book.Book) (PlaybackSnapshot, error) {
+			return manager.Stop(ctx)
+		}},
+		{"start", func(ctx context.Context, manager *PlaybackManager, registeredBook book.Book) (PlaybackSnapshot, error) {
+			return manager.StartContext(ctx, registeredBook, StartRequest{BookID: registeredBook.ID})
+		}},
+		{"set_position", func(ctx context.Context, manager *PlaybackManager, registeredBook book.Book) (PlaybackSnapshot, error) {
+			return manager.SetPositionContext(ctx, registeredBook, 0)
+		}},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			loadStarted := make(chan struct{}, 1)
+			releaseLoad := make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseLoad) }) }
+			manager := NewManagerWithProgress(
+				func(tts.Config) tts.Engine {
+					return &testEngine{speakContext: func(ctx context.Context, _ string) error {
+						<-ctx.Done()
+						return ctx.Err()
+					}}
+				},
+				time.Second,
+				NewEventBroker(),
+				&blockingLoadProgressStore{started: loadStarted, release: releaseLoad},
+			)
+			registeredBook := mustBook(t, writeTempBook(t, "Книга для перевірки deadline."))
+			startErr := make(chan error, 1)
+			startDone := make(chan struct{})
+			go func() {
+				defer close(startDone)
+				_, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID})
+				startErr <- err
+			}()
+			t.Cleanup(func() {
+				manager.BeginShutdown()
+				release()
+				select {
+				case <-startDone:
+				case <-time.After(5 * time.Second):
+					t.Error("Start не завершився після звільнення I/O")
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if _, err := manager.Stop(ctx); err != nil {
+					t.Errorf("не вдалося завершити тестову сесію: %v", err)
+				}
+			})
+			select {
+			case <-loadStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("Start не дійшов до завантаження прогресу")
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			operationDone := make(chan error, 1)
+			go func() {
+				_, err := operation.run(ctx, manager, registeredBook)
+				operationDone <- err
+			}()
+			select {
+			case err := <-operationDone:
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("очікував context.DeadlineExceeded, отримав %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("операція ігнорує deadline під час очікування Start I/O")
+			}
+			if snapshot := manager.Snapshot(); snapshot.State != Stopped {
+				t.Fatalf("скасована операція змінила стан: %#v", snapshot)
+			}
+
+			release()
+			select {
+			case err := <-startErr:
+				if err != nil {
+					t.Fatalf("первинний Start не завершився успішно: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("первинний Start заблоковано після скасування очікувача")
+			}
+			if snapshot := manager.Snapshot(); snapshot.State != Playing {
+				t.Fatalf("скасована операція вплинула на нову сесію: %#v", snapshot)
+			}
+		})
+	}
+}
+
+func TestCanceledStopLeavesPlaybackRunning(t *testing.T) {
+	manager := NewManager(func(tts.Config) tts.Engine {
+		return &testEngine{speakContext: func(ctx context.Context, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+	}, time.Second, NewEventBroker())
+	registeredBook := mustBook(t, writeTempBook(t, "Книга."))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := manager.Stop(ctx); err != nil {
+			t.Errorf("не вдалося завершити тестову сесію: %v", err)
+		}
+	})
+	if _, err := manager.Start(registeredBook, StartRequest{BookID: registeredBook.ID}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	snapshot, err := manager.Stop(ctx)
+	if !errors.Is(err, context.Canceled) || snapshot.State != Playing {
+		t.Fatalf("скасований Stop має залишити сесію активною: snapshot=%#v, err=%v", snapshot, err)
+	}
+}
+
 func TestPlaybackManagerBeginShutdownDoesNotWaitForInFlightStartIO(t *testing.T) {
 	loadStarted := make(chan struct{}, 1)
 	releaseLoad := make(chan struct{})
