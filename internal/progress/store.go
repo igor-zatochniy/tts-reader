@@ -43,7 +43,7 @@ type ProgressStore interface {
 type JSONProgressStore struct{}
 
 func (JSONProgressStore) Load(book book.Book, currentSize int64) (int64, error) {
-	data, err := ReadFile(book.SaveFile)
+	data, err := ReadForBook(book)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, nil
@@ -85,6 +85,58 @@ func ReadFile(path string) ([]byte, error) {
 	}
 	if len(data) > MaxProgressFileSize {
 		return nil, fmt.Errorf("%w: file exceeds %d bytes", ErrFormat, MaxProgressFileSize)
+	}
+	return data, nil
+}
+
+// ReadForBook викликається під lease поточного SaveFile, як і Save.
+// Перенесення залишає legacy-файл незмінним; наявний новий файл завжди пріоритетний.
+func ReadForBook(b book.Book) (data []byte, err error) {
+	data, err = ReadFile(b.SaveFile)
+	if !errors.Is(err, os.ErrNotExist) {
+		return data, err
+	}
+	legacyPath := book.LegacyProgressPath(b.Path, b.SaveFile)
+	if legacyPath == "" {
+		return nil, err
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		return nil, err
+	}
+	lease, err := AcquireLease(legacyPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := lease.Close(); closeErr != nil {
+			data, err = nil, closeErr
+		}
+	}()
+	data, err = ReadFile(legacyPath)
+	if err != nil {
+		return nil, err
+	}
+	var saved Progress
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return nil, fmt.Errorf("%w: invalid legacy progress JSON: %v", ErrFormat, err)
+	}
+	pos, err := ValidateForBook(b, saved, b.Size)
+	if errors.Is(err, ErrBookMismatch) {
+		// Колізійний legacy-файл може належати іншій книзі: його не переносимо й не змінюємо.
+		return nil, os.ErrNotExist
+	}
+	if err != nil {
+		return nil, err
+	}
+	boundary, err := chunk.IsFileUTF8Boundary(b.Path, pos, b.Size)
+	if err != nil {
+		return nil, err
+	}
+	if !boundary {
+		return nil, ErrPositionInside
+	}
+	if err := WriteFileReplace(b.SaveFile, data, 0600); err != nil {
+		return nil, fmt.Errorf("migrate legacy progress: %w", err)
 	}
 	return data, nil
 }

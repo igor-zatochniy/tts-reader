@@ -321,7 +321,7 @@ func (a *App) resolveStartPosition(savedPos int64, hasSave bool) (int64, error) 
 }
 
 func (a *App) loadProgress(bookIdentity book.FileIdentity) (int64, bool, error) {
-	file, err := progress.ReadFile(a.cfg.SaveFile)
+	file, err := progress.ReadForBook(progress.BookForProgress(a.cfg.BookFile, a.cfg.SaveFile, bookIdentity))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, false, nil

@@ -107,6 +107,18 @@ func (s *BookStore) AddContext(ctx context.Context, req AddRequest) (Book, error
 	defer s.mu.Unlock()
 	if id, ok := s.byPath[pathKey]; ok {
 		existing := s.books[id]
+		existingInfo, err := os.Stat(existing.Path)
+		if err != nil {
+			return Book{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
+		}
+		currentInfo, err := os.Stat(absPath)
+		if err != nil {
+			return Book{}, fmt.Errorf("%w: %v", ErrNotReadable, err)
+		}
+		if !os.SameFile(existingInfo, currentInfo) {
+			return Book{}, fmt.Errorf("%w: conflicting canonical book paths", ErrModified)
+		}
+		existing.Path = absPath
 		existing.Size = identity.Size
 		existing.File = identity
 		if strings.TrimSpace(req.Title) != "" {
@@ -166,8 +178,30 @@ func progressPathInDir(dir string, bookPath string) string {
 	if err != nil {
 		key = filepath.Clean(bookPath)
 	}
+	return progressPathForKey(dir, key)
+}
+
+func progressPathForKey(dir, key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return filepath.Join(dir, hex.EncodeToString(sum[:])+".json")
+}
+
+// LegacyProgressPath повертає старе ім'я лише для автоматично обчисленого save path.
+// Вміст такого файлу ще потрібно перевірити: старий ключ міг мати Unicode-колізію.
+func LegacyProgressPath(bookPath, savePath string) string {
+	absPath, key, err := canonicalBookPath(bookPath)
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(savePath)
+	if filepath.Clean(savePath) != progressPathForKey(dir, key) {
+		return ""
+	}
+	legacyKey := legacyPathKey(absPath)
+	if legacyKey == key {
+		return ""
+	}
+	return progressPathForKey(dir, legacyKey)
 }
 
 func canonicalBookPath(path string) (string, string, error) {

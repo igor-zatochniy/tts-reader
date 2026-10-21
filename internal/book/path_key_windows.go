@@ -11,15 +11,17 @@ import (
 )
 
 func canonicalPathKey(path string) string {
+	// EvalSymlinks уже відновлює регістр імен з файлової системи.
+	// Unicode ToLower не відповідає правилам NTFS і може об'єднати різні файли.
+	return path
+}
+
+func legacyPathKey(path string) string {
 	caseSensitive, err := pathUsesCaseSensitiveNames(path)
 	if err != nil {
 		// Точний ключ безпечніший за помилкове об'єднання різних файлів.
 		return path
 	}
-	return windowsPathKey(path, caseSensitive)
-}
-
-func windowsPathKey(path string, caseSensitive bool) string {
 	if caseSensitive {
 		return path
 	}

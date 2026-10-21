@@ -3,6 +3,7 @@
 package book
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,13 +11,73 @@ import (
 	"testing"
 )
 
-func TestWindowsPathKeyUsesDirectorySemantics(t *testing.T) {
-	path := `C:\Books\Book.txt`
-	if got := windowsPathKey(path, true); got != path {
-		t.Fatalf("case-sensitive ключ змінив шлях: %q", got)
+func TestWindowsPathKeyPreservesNormalizedUnicodeNames(t *testing.T) {
+	for _, path := range []string{`C:\Books\Book.txt`, "C:\\Books\\\u0130stanbul.txt", `C:\Books\istanbul.txt`} {
+		if got := canonicalPathKey(path); got != path {
+			t.Fatalf("ключ змінив нормалізований шлях: %q -> %q", path, got)
+		}
 	}
-	if got, want := windowsPathKey(path, false), strings.ToLower(path); got != want {
-		t.Fatalf("case-insensitive ключ = %q, очікувалося %q", got, want)
+}
+
+func TestBookStoreDistinguishesUnicodeNamesOnWindows(t *testing.T) {
+	dir := t.TempDir()
+	paths := []string{filepath.Join(dir, "\u0130stanbul.txt"), filepath.Join(dir, "istanbul.txt")}
+	store := NewStoreWithProgressDir(filepath.Join(dir, "progress"))
+	var registered []Book
+	for i, path := range paths {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, writeErr := f.WriteString([]string{"First book.", "Second independent book."}[i])
+		closeErr := f.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			t.Fatal(err)
+		}
+		b, err := store.Add(AddRequest{Path: path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		registered = append(registered, b)
+	}
+	if registered[0].ID == registered[1].ID || registered[0].SaveFile == registered[1].SaveFile || len(store.List()) != 2 {
+		t.Fatalf("різні Unicode-файли об'єднано: %+v", registered)
+	}
+	for _, b := range registered {
+		current, err := InspectFile(b.Path)
+		if err != nil || !SameFile(b.File, current) {
+			t.Fatalf("шлях книги не відповідає identity: %+v, %v", b, err)
+		}
+	}
+	alias, err := store.Add(AddRequest{Path: filepath.Join(dir, "ISTANBUL.TXT")})
+	if err != nil || alias.ID != registered[1].ID || alias.SaveFile != registered[1].SaveFile {
+		t.Fatalf("ASCII-аліас того самого файлу не розпізнано: %+v, %v", alias, err)
+	}
+}
+
+func TestBookStoreRejectsConflictingPathIndex(t *testing.T) {
+	dir := t.TempDir()
+	firstPath, secondPath := filepath.Join(dir, "first.txt"), filepath.Join(dir, "second.txt")
+	for _, path := range []string{firstPath, secondPath} {
+		if err := os.WriteFile(path, []byte(path), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := NewStoreWithProgressDir(filepath.Join(dir, "progress"))
+	first, err := store.Add(AddRequest{Path: firstPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, key, err := canonicalBookPath(secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.byPath[key] = first.ID
+	if _, err := store.Add(AddRequest{Path: secondPath}); !errors.Is(err, ErrModified) {
+		t.Fatalf("колізія індексу не відхилена: %v", err)
+	}
+	if got, _ := store.Get(first.ID); got != first {
+		t.Fatal("колізія індексу змінила початкову книгу")
 	}
 }
 

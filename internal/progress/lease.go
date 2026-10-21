@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 )
@@ -46,8 +45,8 @@ func AcquireLease(progressPath string) (*Lease, error) {
 		lockPath = filepath.Join(resolvedDir, filepath.Base(lockPath))
 	}
 	key := lockPath
-	if runtime.GOOS == "windows" {
-		key = strings.ToLower(key)
+	if resolved, err := filepath.EvalSymlinks(lockPath); err == nil {
+		key = resolved
 	}
 
 	activeLeases.Lock()
